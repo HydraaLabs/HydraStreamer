@@ -1,0 +1,12 @@
+[project]
+name = "hydrastreamer"
+version = "0.2.0"
+description = "Hydracker local HLS transcoder for 1Fichier direct links"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+hydrastreamer = "hydra_streamer:main"
+
+[tool.pyinstaller]
+name = "HydraStreamer"
