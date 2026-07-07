@@ -4,6 +4,9 @@ $Root = Split-Path -Parent $PSScriptRoot
 $AppDir = Join-Path $env:LOCALAPPDATA "HydraStreamer"
 $LogDir = Join-Path $AppDir "logs"
 $ExeSource = Join-Path $Root "dist\HydraStreamer.exe"
+if (!(Test-Path $ExeSource)) {
+  $ExeSource = Join-Path $PSScriptRoot "dist\HydraStreamer.exe"
+}
 $ExeTarget = Join-Path $AppDir "HydraStreamer.exe"
 
 New-Item -ItemType Directory -Force -Path $AppDir | Out-Null
@@ -16,6 +19,9 @@ if (!(Test-Path $ExeSource)) {
 Copy-Item $ExeSource $ExeTarget -Force
 
 $BinSource = Join-Path (Join-Path (Join-Path $Root "bin") "windows") "x64"
+if (!(Test-Path $BinSource)) {
+  $BinSource = Join-Path (Join-Path (Join-Path $PSScriptRoot "bin") "windows") "x64"
+}
 if ((Test-Path (Join-Path $BinSource "ffmpeg.exe")) -and (Test-Path (Join-Path $BinSource "ffprobe.exe"))) {
   $BinTarget = Join-Path $AppDir "bin"
   New-Item -ItemType Directory -Force -Path $BinTarget | Out-Null

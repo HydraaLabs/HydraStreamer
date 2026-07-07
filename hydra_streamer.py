@@ -19,7 +19,7 @@ from urllib.request import Request, urlopen
 APP_NAME = "HydraStreamer"
 HOST = "127.0.0.1"
 PORT = 17654
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 DEFAULT_UPDATE_MANIFEST_URL = "https://hydracker.com/hydrastreamer/releases/latest.json"
 UPDATE_MANIFEST_URL = os.environ.get("HYDRASTREAMER_UPDATE_URL", DEFAULT_UPDATE_MANIFEST_URL)
 AUTO_UPDATE_ENABLED = os.environ.get("HYDRASTREAMER_AUTO_UPDATE", "1").lower() not in {"0", "false", "no"}

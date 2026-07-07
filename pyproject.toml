@@ -1,6 +1,6 @@
 [project]
 name = "hydrastreamer"
-version = "0.2.0"
+version = "0.2.1"
 description = "Hydracker local HLS transcoder for 1Fichier direct links"
 requires-python = ">=3.10"
 dependencies = []

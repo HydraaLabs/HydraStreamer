@@ -37,6 +37,8 @@ def detect(path):
         return "macos", "pkg"
     if name.endswith(".dmg"):
         return "macos", "dmg"
+    if name.endswith(".zip") and "windows" in name:
+        return "windows", "zip"
     if name.endswith(".zip"):
         return "macos", "zip"
     raise SystemExit(f"Unsupported asset type: {path}")

@@ -109,23 +109,23 @@ macOS `.pkg` when `pkgbuild` is available, otherwise `.zip`:
 ./scripts/package-macos.sh
 ```
 
-Windows asset:
+Windows ZIP installer:
 
 ```powershell
-.\scripts\build-windows.ps1
+.\scripts\package-windows.ps1
 ```
 
-This creates `dist\HydraStreamer.exe` and a versioned update asset such as
-`dist\HydraStreamer-0.2.0-windows-x64.exe`. The Windows auto-updater replaces
-the installed `%LOCALAPPDATA%\HydraStreamer\HydraStreamer.exe` and restarts the
-scheduled task.
+This creates `dist\HydraStreamer-<version>-windows-x64.zip`. The user extracts
+it and runs `install-windows.ps1`; the installer copies the app to
+`%LOCALAPPDATA%\HydraStreamer`, registers the Scheduled Task, and starts it
+immediately.
 
 Generate the update manifest after uploading all assets to the GitHub release:
 
 ```bash
 ./scripts/make-manifest.py \
   --base-url https://github.com/HydraaLabs/HydraStreamer/releases/download/v0.2.0 \
-  dist/HydraStreamer-0.2.0-windows-x64.exe \
+  dist/HydraStreamer-0.2.1-windows-x64.zip \
   dist/hydrastreamer_0.2.0_amd64.deb \
   dist/hydrastreamer-0.2.0-1.x86_64.rpm \
   dist/HydraStreamer-0.2.0-x64.pkg
