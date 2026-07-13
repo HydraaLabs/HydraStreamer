@@ -1,0 +1,173 @@
+name: Release desktop packages
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to update
+        required: true
+        default: v0.2.1
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Resolve version
+        shell: pwsh
+        run: |
+          $Version = (Select-String -Path "hydra_streamer.py" -Pattern '^VERSION\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
+          if ("v$Version" -ne "${{ inputs.tag }}") {
+            throw "Source version $Version does not match release tag ${{ inputs.tag }}"
+          }
+          "VERSION=$Version" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Download FFmpeg runtime
+        run: python scripts/download-runtime-bins.py windows-x64
+
+      - name: Build HydraStreamer
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-build.txt
+          python -m PyInstaller --clean --onefile --name HydraStreamer hydra_streamer.py
+          .\dist\HydraStreamer.exe --version
+
+      - name: Package and verify Windows x64
+        shell: pwsh
+        run: |
+          .\scripts\package-windows.ps1
+          $Package = "dist\HydraStreamer-$env:VERSION-windows-x64.zip"
+          $Check = Join-Path $env:RUNNER_TEMP "hydrastreamer-windows-check"
+          Expand-Archive -Path $Package -DestinationPath $Check -Force
+          $Required = @(
+            "dist\HydraStreamer.exe",
+            "bin\windows\x64\ffmpeg.exe",
+            "bin\windows\x64\ffprobe.exe",
+            "install-windows.ps1"
+          )
+          foreach ($File in $Required) {
+            if (!(Test-Path (Join-Path $Check $File))) {
+              throw "Missing packaged file: $File"
+            }
+          }
+          & (Join-Path $Check "dist\HydraStreamer.exe") --version
+          & (Join-Path $Check "bin\windows\x64\ffmpeg.exe") -version | Select-Object -First 1
+          & (Join-Path $Check "bin\windows\x64\ffprobe.exe") -version | Select-Object -First 1
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64
+          path: dist/HydraStreamer-${{ env.VERSION }}-windows-x64.zip
+          if-no-files-found: error
+          compression-level: 0
+
+  macos:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15-intel
+            arch: x64
+          - runner: macos-15
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Resolve version
+        run: |
+          VERSION="$(python3 -c 'import re; from pathlib import Path; print(re.search(r"^VERSION\s*=\s*\"([^\"]+)\"", Path("hydra_streamer.py").read_text(), re.M).group(1))')"
+          test "v$VERSION" = "${{ inputs.tag }}"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      - name: Build and package macOS ${{ matrix.arch }}
+        env:
+          HYDRASTREAMER_BUNDLE_ARCH: ${{ matrix.arch }}
+        run: |
+          test "$(uname -m | sed 's/x86_64/x64/')" = "${{ matrix.arch }}"
+          ./scripts/build-linux-macos.sh
+          ./dist/HydraStreamer --version
+          ./scripts/package-macos.sh
+
+      - name: Verify macOS ${{ matrix.arch }} package
+        run: |
+          PACKAGE="dist/HydraStreamer-$VERSION-${{ matrix.arch }}.pkg"
+          test -f "$PACKAGE"
+          CHECK="$RUNNER_TEMP/hydrastreamer-macos-check"
+          pkgutil --expand-full "$PACKAGE" "$CHECK"
+          APP="$CHECK/Payload/Applications/HydraStreamer"
+          test -x "$APP/HydraStreamer"
+          test -x "$APP/bin/ffmpeg"
+          test -x "$APP/bin/ffprobe"
+          file "$APP/HydraStreamer" "$APP/bin/ffmpeg" "$APP/bin/ffprobe"
+          "$APP/HydraStreamer" --version
+          "$APP/bin/ffmpeg" -version | head -n 1
+          "$APP/bin/ffprobe" -version | head -n 1
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ matrix.arch }}
+          path: dist/HydraStreamer-${{ env.VERSION }}-${{ matrix.arch }}.pkg
+          if-no-files-found: error
+          compression-level: 0
+
+  publish:
+    needs: [windows, macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Verify release and retain Linux assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY"
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern '*.deb' --dir release-assets
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern '*.rpm' --dir release-assets
+
+      - name: Build complete update manifest
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          ./scripts/make-manifest.py \
+            --base-url "https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG" \
+            --out release-assets/latest.json \
+            release-assets/*windows-x64.zip \
+            release-assets/*x64.pkg \
+            release-assets/*arm64.pkg \
+            release-assets/*.deb \
+            release-assets/*.rpm
+          python3 -m json.tool release-assets/latest.json
+          sha256sum release-assets/*
+
+      - name: Publish desktop packages
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          gh release upload "$TAG" \
+            release-assets/*windows-x64.zip \
+            release-assets/*x64.pkg \
+            release-assets/*arm64.pkg \
+            release-assets/latest.json \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber
