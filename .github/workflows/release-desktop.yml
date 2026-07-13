@@ -192,6 +192,7 @@ jobs:
             --base-url "https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG" \
             --out release-assets/latest.json \
             release-assets/*windows-x64.exe \
+            release-assets/*windows-x64-setup.exe \
             release-assets/*windows-x64.zip \
             release-assets/*x64.pkg \
             release-assets/*arm64.pkg \
