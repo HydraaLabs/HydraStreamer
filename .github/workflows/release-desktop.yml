@@ -79,12 +79,25 @@ jobs:
           if (!(Test-Path $Setup)) {
             throw "Windows installer was not created"
           }
-          $Names = & 7z l -ba $Setup
-          foreach ($Required in @("HydraStreamer.exe", "ffmpeg.exe", "ffprobe.exe")) {
-            if (!($Names -match [regex]::Escape($Required))) {
-              throw "Installer is missing $Required"
+          $Check = Join-Path $env:RUNNER_TEMP "hydrastreamer-setup-check"
+          $Process = Start-Process -FilePath $Setup -ArgumentList @(
+            "/VERYSILENT",
+            "/SUPPRESSMSGBOXES",
+            "/NORESTART",
+            "/NOICONS",
+            "/DIR=`"$Check`""
+          ) -Wait -PassThru
+          if ($Process.ExitCode -ne 0) {
+            throw "Installer exited with code $($Process.ExitCode)"
+          }
+          foreach ($Required in @("HydraStreamer.exe", "bin\ffmpeg.exe", "bin\ffprobe.exe")) {
+            if (!(Test-Path (Join-Path $Check $Required))) {
+              throw "Installed application is missing $Required"
             }
           }
+          & (Join-Path $Check "HydraStreamer.exe") --version
+          & (Join-Path $Check "bin\ffmpeg.exe") -version | Select-Object -First 1
+          & (Join-Path $Check "bin\ffprobe.exe") -version | Select-Object -First 1
 
       - uses: actions/upload-artifact@v4
         with:
