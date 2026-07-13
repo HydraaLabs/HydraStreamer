@@ -66,11 +66,32 @@ jobs:
           & (Join-Path $Check "bin\windows\x64\ffmpeg.exe") -version | Select-Object -First 1
           & (Join-Path $Check "bin\windows\x64\ffprobe.exe") -version | Select-Object -First 1
 
+      - name: Build and verify Windows installer
+        shell: pwsh
+        run: |
+          $Iscc = (Get-Command iscc.exe -ErrorAction SilentlyContinue).Source
+          if (!$Iscc) {
+            choco install innosetup --yes --no-progress
+            $Iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          }
+          & $Iscc "/DAppVersion=$env:VERSION" "scripts\HydraStreamer.iss"
+          $Setup = "dist\HydraStreamer-$env:VERSION-windows-x64-setup.exe"
+          if (!(Test-Path $Setup)) {
+            throw "Windows installer was not created"
+          }
+          $Names = & 7z l -ba $Setup
+          foreach ($Required in @("HydraStreamer.exe", "ffmpeg.exe", "ffprobe.exe")) {
+            if (!($Names -match [regex]::Escape($Required))) {
+              throw "Installer is missing $Required"
+            }
+          }
+
       - uses: actions/upload-artifact@v4
         with:
           name: windows-x64
           path: |
             dist/HydraStreamer-${{ env.VERSION }}-windows-x64.exe
+            dist/HydraStreamer-${{ env.VERSION }}-windows-x64-setup.exe
             dist/HydraStreamer-${{ env.VERSION }}-windows-x64.zip
           if-no-files-found: error
           compression-level: 0
@@ -173,6 +194,7 @@ jobs:
         run: |
           gh release upload "$TAG" \
             release-assets/*windows-x64.exe \
+            release-assets/*windows-x64-setup.exe \
             release-assets/*windows-x64.zip \
             release-assets/*x64.pkg \
             release-assets/*arm64.pkg \
