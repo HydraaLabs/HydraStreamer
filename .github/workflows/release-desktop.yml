@@ -42,6 +42,7 @@ jobs:
           python -m pip install -r requirements-build.txt
           python -m PyInstaller --clean --onefile --name HydraStreamer hydra_streamer.py
           .\dist\HydraStreamer.exe --version
+          Copy-Item .\dist\HydraStreamer.exe ".\dist\HydraStreamer-$env:VERSION-windows-x64.exe" -Force
 
       - name: Package and verify Windows x64
         shell: pwsh
@@ -68,7 +69,9 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: windows-x64
-          path: dist/HydraStreamer-${{ env.VERSION }}-windows-x64.zip
+          path: |
+            dist/HydraStreamer-${{ env.VERSION }}-windows-x64.exe
+            dist/HydraStreamer-${{ env.VERSION }}-windows-x64.zip
           if-no-files-found: error
           compression-level: 0
 
@@ -154,6 +157,7 @@ jobs:
           ./scripts/make-manifest.py \
             --base-url "https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG" \
             --out release-assets/latest.json \
+            release-assets/*windows-x64.exe \
             release-assets/*windows-x64.zip \
             release-assets/*x64.pkg \
             release-assets/*arm64.pkg \
@@ -168,6 +172,7 @@ jobs:
           TAG: ${{ inputs.tag }}
         run: |
           gh release upload "$TAG" \
+            release-assets/*windows-x64.exe \
             release-assets/*windows-x64.zip \
             release-assets/*x64.pkg \
             release-assets/*arm64.pkg \
