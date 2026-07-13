@@ -35,7 +35,11 @@ TARGETS = {
 
 
 def fetch_json(url):
-    req = Request(url, headers={"Accept": "application/vnd.github+json", "User-Agent": USER_AGENT})
+    headers = {"Accept": "application/vnd.github+json", "User-Agent": USER_AGENT}
+    token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    req = Request(url, headers=headers)
     with urlopen(req, timeout=30) as response:
         return json.loads(response.read().decode("utf-8"))
 

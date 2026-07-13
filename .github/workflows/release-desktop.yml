@@ -31,6 +31,8 @@ jobs:
           "VERSION=$Version" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Download FFmpeg runtime
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: python scripts/download-runtime-bins.py windows-x64
 
       - name: Build HydraStreamer
@@ -95,6 +97,7 @@ jobs:
 
       - name: Build and package macOS ${{ matrix.arch }}
         env:
+          GITHUB_TOKEN: ${{ github.token }}
           HYDRASTREAMER_BUNDLE_ARCH: ${{ matrix.arch }}
         run: |
           test "$(uname -m | sed 's/x86_64/x64/')" = "${{ matrix.arch }}"
