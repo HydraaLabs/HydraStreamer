@@ -10,6 +10,14 @@ Endpoints:
 - `GET /version`
 - `GET /probe?url=...`
 - `GET /stream.m3u8?url=...&audio=1`
+- `POST /forward` — exécute un petit appel HTTPS API depuis l'IP du client
+  (débridage 1Fichier sans proxy : l'API et le téléchargement partagent la
+  même IP, donc pas de verrouillage IP). Allowlist d'hôtes
+  (`HYDRASTREAMER_FORWARD_HOSTS`, défaut `api.1fichier.com`), allowlist
+  d'origines navigateur (`HYDRASTREAMER_FORWARD_ORIGINS`, défaut
+  `https://hydracker.com,https://www.hydracker.com`), 1 req/s/hôte. `/health`
+  et `/version` exposent `capabilities.forward: true` quand l'endpoint est
+  disponible.
 
 `/version` returns the local app version, platform, architecture and the last
 auto-update state. The updater checks:

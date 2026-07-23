@@ -12,6 +12,7 @@ import threading
 import time
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
+from urllib.error import HTTPError
 from urllib.parse import parse_qs, unquote, urlparse
 from urllib.request import Request, urlopen
 
@@ -19,7 +20,7 @@ from urllib.request import Request, urlopen
 APP_NAME = "HydraStreamer"
 HOST = "127.0.0.1"
 PORT = 17654
-VERSION = "0.2.2"
+VERSION = "0.3.0"
 DEFAULT_UPDATE_MANIFEST_URL = "https://hydracker.com/hydrastreamer/releases/latest.json"
 UPDATE_MANIFEST_URL = os.environ.get("HYDRASTREAMER_UPDATE_URL", DEFAULT_UPDATE_MANIFEST_URL)
 AUTO_UPDATE_ENABLED = os.environ.get("HYDRASTREAMER_AUTO_UPDATE", "1").lower() not in {"0", "false", "no"}
@@ -41,8 +42,42 @@ UPDATE_STATE = {
     "error": None,
 }
 
+# `/forward` executes small HTTPS API calls (e.g. 1Fichier get_token) from the
+# client's own IP, so the debrid API and the file download share one IP and no
+# proxy lock applies. Guard rails: target host allowlist, browser Origin
+# allowlist, bounded payloads, 1 req/s/host (native 1Fichier API limit).
+FORWARD_ALLOWED_HOSTS = {
+    h.strip().lower()
+    for h in os.environ.get("HYDRASTREAMER_FORWARD_HOSTS", "api.1fichier.com").split(",")
+    if h.strip()
+}
+FORWARD_ALLOWED_ORIGINS = {
+    o.strip()
+    for o in os.environ.get(
+        "HYDRASTREAMER_FORWARD_ORIGINS",
+        "https://hydracker.com,https://www.hydracker.com",
+    ).split(",")
+    if o.strip()
+}
+FORWARD_MAX_BODY = 16 * 1024
+FORWARD_MAX_RESPONSE = 2 * 1024 * 1024
+FORWARD_THROTTLE = {}
+# Only these request headers are forwarded to the target host.
+FORWARD_HEADER_ALLOWLIST = {"authorization", "content-type", "accept", "user-agent"}
+
 
 def cors(handler):
+    # `/forward` carries API tokens: never answer with a wildcard origin.
+    # Browsers enforce Origin on cross-origin POSTs, so echoing only the
+    # allowlisted Hydracker origins blocks other sites from driving the daemon.
+    if urlparse(handler.path).path == "/forward":
+        origin = handler.headers.get("Origin")
+        if origin and origin in FORWARD_ALLOWED_ORIGINS:
+            handler.send_header("Access-Control-Allow-Origin", origin)
+            handler.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+            handler.send_header("Access-Control-Allow-Methods", "POST, OPTIONS")
+            handler.send_header("Vary", "Origin")
+        return
     handler.send_header("Access-Control-Allow-Origin", "*")
     handler.send_header("Access-Control-Allow-Headers", "Range, Content-Type")
     handler.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
@@ -176,6 +211,7 @@ def runtime_info():
         "frozen": bool(getattr(sys, "frozen", False)),
         "manifest_url": UPDATE_MANIFEST_URL,
         "auto_update": AUTO_UPDATE_ENABLED,
+        "capabilities": {"forward": True},
     }
 
 
@@ -531,6 +567,16 @@ def start_job(url, audio_index, start_time, cookies=None):
         return key, job
 
 
+def throttle_forward(host):
+    now = time.time()
+    with LOCK:
+        last = FORWARD_THROTTLE.get(host, 0.0)
+        if now - last < 1.0:
+            return False
+        FORWARD_THROTTLE[host] = now
+        return True
+
+
 class DummyProcess:
     def poll(self):
         return 0
@@ -540,6 +586,75 @@ class Handler(SimpleHTTPRequestHandler):
     def do_OPTIONS(self):
         self.send_response(204)
         self.end_headers()
+
+    def do_POST(self):
+        if urlparse(self.path).path == "/forward":
+            return self.handle_forward()
+        return json_response(self, 404, {"error": "not_found"})
+
+    def handle_forward(self):
+        origin = self.headers.get("Origin")
+        if origin and origin not in FORWARD_ALLOWED_ORIGINS:
+            return json_response(self, 403, {"error": "origin_not_allowed"})
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = 0
+        if length <= 0 or length > FORWARD_MAX_BODY:
+            return json_response(self, 400, {"error": "invalid_length"})
+        try:
+            payload = json.loads(self.rfile.read(length).decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return json_response(self, 400, {"error": "invalid_json"})
+
+        url = str(payload.get("url") or "")
+        method = str(payload.get("method") or "POST").upper()
+        headers = payload.get("headers") or {}
+        body = payload.get("body")
+
+        target = urlparse(url)
+        host = (target.hostname or "").lower()
+        # https obligatoire ; http toléré uniquement vers loopback (tests/mock
+        # local — ces hôtes ne sont jamais dans l'allowlist par défaut).
+        scheme_ok = target.scheme == "https" or (
+            target.scheme == "http" and host in {"127.0.0.1", "localhost"}
+        )
+        if not scheme_ok or host not in FORWARD_ALLOWED_HOSTS:
+            return json_response(self, 403, {"error": "host_not_allowed"})
+        if method not in {"GET", "POST"} or not isinstance(headers, dict):
+            return json_response(self, 400, {"error": "method_not_allowed"})
+        if not throttle_forward(host):
+            return json_response(self, 429, {"error": "rate_limited"})
+
+        data = None
+        if method == "POST":
+            if isinstance(body, (dict, list)):
+                data = json.dumps(body).encode("utf-8")
+                headers = {**headers, "Content-Type": "application/json"}
+            elif isinstance(body, str):
+                data = body.encode("utf-8")
+        safe_headers = {
+            k: str(v) for k, v in headers.items()
+            if isinstance(k, str) and k.lower() in FORWARD_HEADER_ALLOWLIST
+        }
+
+        request = Request(url, data=data, method=method, headers=safe_headers)
+        try:
+            with urlopen(request, timeout=20) as response:
+                raw = response.read(FORWARD_MAX_RESPONSE + 1)
+                status = response.status
+        except HTTPError as exc:
+            # 4xx/5xx still carry the API's JSON error body the caller needs.
+            raw = exc.read(FORWARD_MAX_RESPONSE + 1)
+            status = exc.code
+        except Exception as exc:
+            return json_response(self, 502, {"error": "forward_failed", "detail": str(exc)[:300]})
+
+        return json_response(self, 200, {
+            "status": status,
+            "body": raw[:FORWARD_MAX_RESPONSE].decode("utf-8", errors="replace"),
+            "truncated": len(raw) > FORWARD_MAX_RESPONSE,
+        })
 
     def do_GET(self):
         parsed = urlparse(self.path)
@@ -563,6 +678,7 @@ class Handler(SimpleHTTPRequestHandler):
                     "version": VERSION,
                     "ffmpeg": ffmpeg,
                     "ffprobe": ffprobe,
+                    "capabilities": {"forward": True},
                 },
             )
 
