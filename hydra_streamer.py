@@ -20,7 +20,7 @@ from urllib.request import Request, urlopen
 APP_NAME = "HydraStreamer"
 HOST = "127.0.0.1"
 PORT = 17654
-VERSION = "0.3.1"
+VERSION = "0.3.2"
 DEFAULT_UPDATE_MANIFEST_URL = "https://hydracker.com/hydrastreamer/releases/latest.json"
 UPDATE_MANIFEST_URL = os.environ.get("HYDRASTREAMER_UPDATE_URL", DEFAULT_UPDATE_MANIFEST_URL)
 AUTO_UPDATE_ENABLED = os.environ.get("HYDRASTREAMER_AUTO_UPDATE", "1").lower() not in {"0", "false", "no"}
@@ -59,15 +59,32 @@ FORWARD_ALLOWED_HOSTS = {
     ).split(",")
     if h.strip()
 }
+# Override optionnel des origines (liste exacte CSV). Sans override, TOUTES
+# les origines hydracker.* sont acceptées (com/net/site/local + sous-domaines)
+# via forward_origin_allowed().
 FORWARD_ALLOWED_ORIGINS = {
     o.strip()
-    for o in os.environ.get(
-        "HYDRASTREAMER_FORWARD_ORIGINS",
-        "https://hydracker.com,https://www.hydracker.com,"
-        "https://hydracker.local,https://app.hydracker.local",
-    ).split(",")
+    for o in os.environ.get("HYDRASTREAMER_FORWARD_ORIGINS", "").split(",")
     if o.strip()
 }
+
+
+def forward_origin_allowed(origin):
+    # Pas d'en-tête Origin (client non-navigateur) : accepté, comme avant.
+    if not origin:
+        return True
+    if FORWARD_ALLOWED_ORIGINS:
+        return origin in FORWARD_ALLOWED_ORIGINS
+    parsed = urlparse(origin)
+    host = (parsed.hostname or "").lower()
+    parts = host.split(".")
+    # hydracker doit être le domaine enregistré (avant-dernier label) :
+    # hydracker.com/net/site/local + sous-domaines (app., streaming., www.…).
+    # `hydracker.evil.com` est rejeté (hydracker n'est qu'un sous-domaine).
+    if len(parts) < 2 or parts[-2] != "hydracker":
+        return False
+    # https obligatoire, http toléré en dev (.local uniquement).
+    return parsed.scheme == "https" or host.endswith(".local")
 FORWARD_MAX_BODY = 16 * 1024
 FORWARD_MAX_RESPONSE = 2 * 1024 * 1024
 FORWARD_THROTTLE = {}
@@ -81,7 +98,7 @@ def cors(handler):
     # allowlisted Hydracker origins blocks other sites from driving the daemon.
     if urlparse(handler.path).path == "/forward":
         origin = handler.headers.get("Origin")
-        if origin and origin in FORWARD_ALLOWED_ORIGINS:
+        if origin and forward_origin_allowed(origin):
             handler.send_header("Access-Control-Allow-Origin", origin)
             handler.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
             handler.send_header("Access-Control-Allow-Methods", "POST, OPTIONS")
@@ -603,7 +620,7 @@ class Handler(SimpleHTTPRequestHandler):
 
     def handle_forward(self):
         origin = self.headers.get("Origin")
-        if origin and origin not in FORWARD_ALLOWED_ORIGINS:
+        if origin and not forward_origin_allowed(origin):
             return json_response(self, 403, {"error": "origin_not_allowed"})
         try:
             length = int(self.headers.get("Content-Length") or 0)
