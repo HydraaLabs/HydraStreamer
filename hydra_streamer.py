@@ -19,7 +19,7 @@ from urllib.request import Request, urlopen
 APP_NAME = "HydraStreamer"
 HOST = "127.0.0.1"
 PORT = 17654
-VERSION = "0.2.1"
+VERSION = "0.2.2"
 DEFAULT_UPDATE_MANIFEST_URL = "https://hydracker.com/hydrastreamer/releases/latest.json"
 UPDATE_MANIFEST_URL = os.environ.get("HYDRASTREAMER_UPDATE_URL", DEFAULT_UPDATE_MANIFEST_URL)
 AUTO_UPDATE_ENABLED = os.environ.get("HYDRASTREAMER_AUTO_UPDATE", "1").lower() not in {"0", "false", "no"}
@@ -29,6 +29,9 @@ JOBS = {}
 LOCK = threading.Lock()
 LOG_HANDLE = None
 IDLE_JOB_TTL_SECONDS = 180
+# Hide console windows of child processes (ffmpeg, ffprobe, ...) on Windows,
+# required once the app itself is built without a console (--noconsole).
+CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 UPDATE_STATE = {
     "checked_at": None,
     "status": "idle",
@@ -105,7 +108,7 @@ def probe(url, cookies=None):
     if cookies:
         cmd.extend(["-cookies", cookies])
     cmd.append(url)
-    proc = subprocess.run(cmd, text=True, timeout=30, capture_output=True)
+    proc = subprocess.run(cmd, text=True, timeout=30, capture_output=True, creationflags=CREATE_NO_WINDOW)
     if proc.returncode != 0:
         detail = (proc.stderr or proc.stdout or "").strip()
         raise RuntimeError(classify_media_error(detail))
@@ -241,7 +244,7 @@ def select_update_asset(manifest):
     system = current_platform()
     arch = current_arch()
     preferred_formats = {
-        "windows": ["exe", "msi"],
+        "windows": ["setup", "exe", "msi"],
         "linux": linux_package_preference(),
         "macos": ["pkg", "dmg", "zip"],
     }.get(system, [])
@@ -255,7 +258,7 @@ def select_update_asset(manifest):
         for asset in candidates:
             if str(asset.get("format", "")).lower() == fmt:
                 return asset
-    return candidates[0] if candidates else None
+    return None
 
 
 def linux_package_preference():
@@ -297,9 +300,13 @@ def install_update_asset(path, asset):
     system = current_platform()
     if system == "windows":
         if fmt == "msi":
-            subprocess.Popen(["msiexec", "/i", str(path), "/passive"])
-        else:
+            subprocess.Popen(["msiexec", "/i", str(path), "/passive"], creationflags=CREATE_NO_WINDOW)
+        elif fmt == "setup":
+            install_windows_setup_update(path)
+        elif fmt == "exe":
             install_windows_exe_update(path)
+        else:
+            raise RuntimeError(f"unsupported windows update format: {fmt}")
         return
     if system == "macos":
         if fmt == "pkg":
@@ -321,26 +328,27 @@ def install_update_asset(path, asset):
     raise RuntimeError(f"unsupported update platform: {system}")
 
 
-def install_windows_exe_update(path):
-    if current_platform() != "windows":
-        raise RuntimeError("windows update called on non-windows platform")
-    target = Path(os.environ.get("LOCALAPPDATA", str(app_dir()))) / "HydraStreamer" / "HydraStreamer.exe"
-    if not target.exists():
-        subprocess.Popen([str(path)])
-        return
+def windows_app_paths():
+    app_home = Path(os.environ.get("LOCALAPPDATA", str(app_dir()))) / "HydraStreamer"
+    return app_home / "HydraStreamer.exe", app_home / "logs" / "hydrastreamer.log"
+
+
+def windows_restart_lines(exe):
+    # Restart through the Scheduled Task when present (install-windows.ps1),
+    # otherwise start the exe directly (Inno Setup startup shortcut installs).
+    _, log_file = windows_app_paths()
+    return [
+        "Start-ScheduledTask -TaskName 'HydraStreamer'",
+        "Start-Sleep -Seconds 3",
+        "if (-not (Get-Process -Name 'HydraStreamer' -ErrorAction SilentlyContinue)) {",
+        f"  Start-Process -FilePath {ps_quote(str(exe))} -ArgumentList '--log-file',{ps_quote(str(log_file))}",
+        "}",
+    ]
+
+
+def run_windows_update_script(lines):
     script = Path(tempfile.gettempdir()) / "HydraStreamer-update.ps1"
-    script.write_text(
-        "\n".join([
-            "$ErrorActionPreference = 'SilentlyContinue'",
-            "Start-Sleep -Seconds 2",
-            "Stop-ScheduledTask -TaskName 'HydraStreamer'",
-            "Stop-Process -Name 'HydraStreamer' -Force",
-            "Start-Sleep -Seconds 1",
-            f"Copy-Item -LiteralPath {ps_quote(str(path))} -Destination {ps_quote(str(target))} -Force",
-            "Start-ScheduledTask -TaskName 'HydraStreamer'",
-        ]),
-        encoding="utf-8",
-    )
+    script.write_text("\n".join(lines), encoding="utf-8")
     subprocess.Popen([
         "powershell.exe",
         "-NoProfile",
@@ -348,6 +356,39 @@ def install_windows_exe_update(path):
         "Bypass",
         "-File",
         str(script),
+    ], creationflags=CREATE_NO_WINDOW)
+
+
+def install_windows_exe_update(path):
+    if current_platform() != "windows":
+        raise RuntimeError("windows update called on non-windows platform")
+    target, _ = windows_app_paths()
+    if not target.exists():
+        subprocess.Popen([str(path)], creationflags=CREATE_NO_WINDOW)
+        return
+    run_windows_update_script([
+        "$ErrorActionPreference = 'SilentlyContinue'",
+        "Start-Sleep -Seconds 2",
+        "Stop-ScheduledTask -TaskName 'HydraStreamer'",
+        "Stop-Process -Name 'HydraStreamer' -Force",
+        "Start-Sleep -Seconds 1",
+        f"Copy-Item -LiteralPath {ps_quote(str(path))} -Destination {ps_quote(str(target))} -Force",
+        *windows_restart_lines(target),
+    ])
+
+
+def install_windows_setup_update(path):
+    if current_platform() != "windows":
+        raise RuntimeError("windows update called on non-windows platform")
+    exe, _ = windows_app_paths()
+    run_windows_update_script([
+        "$ErrorActionPreference = 'SilentlyContinue'",
+        "Start-Sleep -Seconds 2",
+        "Stop-ScheduledTask -TaskName 'HydraStreamer'",
+        "Stop-Process -Name 'HydraStreamer' -Force",
+        "Start-Sleep -Seconds 1",
+        f"Start-Process -FilePath {ps_quote(str(path))} -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART' -Wait",
+        *windows_restart_lines(exe),
     ])
 
 
@@ -475,7 +516,7 @@ def start_job(url, audio_index, start_time, cookies=None):
             str(playlist),
         ])
         log = open(log_file, "ab")
-        process = subprocess.Popen(cmd, stdout=log, stderr=log)
+        process = subprocess.Popen(cmd, stdout=log, stderr=log, creationflags=CREATE_NO_WINDOW)
         job = {
             "url": url,
             "audio_index": audio_index,

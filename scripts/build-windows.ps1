@@ -17,6 +17,7 @@ if (!(Test-Path "bin\windows\x64\ffmpeg.exe") -or !(Test-Path "bin\windows\x64\f
 .\.venv\Scripts\pyinstaller.exe `
   --clean `
   --onefile `
+  --noconsole `
   --name HydraStreamer `
   hydra_streamer.py
 

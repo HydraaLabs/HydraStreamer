@@ -28,7 +28,7 @@ def sha256(path):
 def detect(path):
     name = path.name.lower()
     if name.endswith(".exe"):
-        return "windows", "exe"
+        return "windows", "setup" if "setup" in name else "exe"
     if name.endswith(".deb"):
         return "linux", "deb"
     if name.endswith(".rpm"):

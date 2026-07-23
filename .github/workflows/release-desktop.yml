@@ -6,7 +6,7 @@ on:
       tag:
         description: Existing release tag to update
         required: true
-        default: v0.2.1
+        default: v0.2.2
 
 permissions:
   contents: write
@@ -40,7 +40,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r requirements-build.txt
-          python -m PyInstaller --clean --onefile --name HydraStreamer hydra_streamer.py
+          python -m PyInstaller --clean --onefile --noconsole --name HydraStreamer hydra_streamer.py
           .\dist\HydraStreamer.exe --version
           Copy-Item .\dist\HydraStreamer.exe ".\dist\HydraStreamer-$env:VERSION-windows-x64.exe" -Force
 
