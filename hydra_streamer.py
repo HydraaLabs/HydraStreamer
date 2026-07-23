@@ -20,7 +20,7 @@ from urllib.request import Request, urlopen
 APP_NAME = "HydraStreamer"
 HOST = "127.0.0.1"
 PORT = 17654
-VERSION = "0.3.0"
+VERSION = "0.3.1"
 DEFAULT_UPDATE_MANIFEST_URL = "https://hydracker.com/hydrastreamer/releases/latest.json"
 UPDATE_MANIFEST_URL = os.environ.get("HYDRASTREAMER_UPDATE_URL", DEFAULT_UPDATE_MANIFEST_URL)
 AUTO_UPDATE_ENABLED = os.environ.get("HYDRASTREAMER_AUTO_UPDATE", "1").lower() not in {"0", "false", "no"}
@@ -48,14 +48,23 @@ UPDATE_STATE = {
 # allowlist, bounded payloads, 1 req/s/host (native 1Fichier API limit).
 FORWARD_ALLOWED_HOSTS = {
     h.strip().lower()
-    for h in os.environ.get("HYDRASTREAMER_FORWARD_HOSTS", "api.1fichier.com").split(",")
+    for h in os.environ.get(
+        "HYDRASTREAMER_FORWARD_HOSTS",
+        "api.1fichier.com,"
+        "api.alldebrid.com,"
+        "api.real-debrid.com,"
+        "debrid-link.com,"
+        "www.premiumize.me,"
+        "api.torbox.app",
+    ).split(",")
     if h.strip()
 }
 FORWARD_ALLOWED_ORIGINS = {
     o.strip()
     for o in os.environ.get(
         "HYDRASTREAMER_FORWARD_ORIGINS",
-        "https://hydracker.com,https://www.hydracker.com",
+        "https://hydracker.com,https://www.hydracker.com,"
+        "https://hydracker.local,https://app.hydracker.local",
     ).split(",")
     if o.strip()
 }

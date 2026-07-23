@@ -90,7 +90,13 @@ set -e
 
 if command -v systemctl >/dev/null 2>&1; then
   systemctl daemon-reload || true
-  systemctl enable --now hydrastreamer.service || true
+  if systemctl is-active --quiet hydrastreamer.service; then
+    # Upgrade : le binaire a changé, relancer le daemon (enable --now seul
+    # ne redémarre pas un service déjà actif).
+    systemctl restart hydrastreamer.service || true
+  else
+    systemctl enable --now hydrastreamer.service || true
+  fi
 fi
 
 exit 0
@@ -146,7 +152,11 @@ direct video links to browser-compatible HLS.
 
 %post
 systemctl daemon-reload >/dev/null 2>&1 || true
-systemctl enable --now hydrastreamer.service >/dev/null 2>&1 || true
+if systemctl is-active --quiet hydrastreamer.service; then
+  systemctl restart hydrastreamer.service >/dev/null 2>&1 || true
+else
+  systemctl enable --now hydrastreamer.service >/dev/null 2>&1 || true
+fi
 
 %preun
 if [ "\$1" = "0" ]; then
