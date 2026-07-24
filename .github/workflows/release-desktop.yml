@@ -6,7 +6,7 @@ on:
       tag:
         description: Existing release tag to update
         required: true
-        default: v0.3.2
+        default: v0.3.3
 
 permissions:
   contents: write

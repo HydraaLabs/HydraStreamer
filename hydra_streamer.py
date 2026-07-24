@@ -20,7 +20,7 @@ from urllib.request import Request, urlopen
 APP_NAME = "HydraStreamer"
 HOST = "127.0.0.1"
 PORT = 17654
-VERSION = "0.3.2"
+VERSION = "0.3.3"
 DEFAULT_UPDATE_MANIFEST_URL = "https://hydracker.com/hydrastreamer/releases/latest.json"
 UPDATE_MANIFEST_URL = os.environ.get("HYDRASTREAMER_UPDATE_URL", DEFAULT_UPDATE_MANIFEST_URL)
 AUTO_UPDATE_ENABLED = os.environ.get("HYDRASTREAMER_AUTO_UPDATE", "1").lower() not in {"0", "false", "no"}
@@ -29,7 +29,7 @@ ROOT = Path(tempfile.gettempdir()) / "hydra-streamer"
 JOBS = {}
 LOCK = threading.Lock()
 LOG_HANDLE = None
-IDLE_JOB_TTL_SECONDS = 180
+IDLE_JOB_TTL_SECONDS = 900
 # Hide console windows of child processes (ffmpeg, ffprobe, ...) on Windows,
 # required once the app itself is built without a console (--noconsole).
 CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
@@ -854,8 +854,12 @@ def cleanup_loop():
             for key, job in list(JOBS.items()):
                 process = job.get("process")
                 expired = now - float(job.get("last_access") or 0) > IDLE_JOB_TTL_SECONDS
-                stopped = process is None or process.poll() is not None
-                if expired or stopped:
+                # Ne JAMAIS supprimer un job parce que ffmpeg s'est terminé :
+                # le transcodage va ~5x plus vite que la lecture, donc ffmpeg
+                # finit bien avant le spectateur — les segments sur disque
+                # doivent rester servables jusqu'à la fin du TTL d'inactivité
+                # (sinon la lecture repart au début en plein milieu).
+                if expired:
                     stop_process(process)
                     shutil.rmtree(job.get("dir"), ignore_errors=True)
                     JOBS.pop(key, None)
