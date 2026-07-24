@@ -20,7 +20,7 @@ from urllib.request import Request, urlopen
 APP_NAME = "HydraStreamer"
 HOST = "127.0.0.1"
 PORT = 17654
-VERSION = "0.3.3"
+VERSION = "0.3.4"
 DEFAULT_UPDATE_MANIFEST_URL = "https://hydracker.com/hydrastreamer/releases/latest.json"
 UPDATE_MANIFEST_URL = os.environ.get("HYDRASTREAMER_UPDATE_URL", DEFAULT_UPDATE_MANIFEST_URL)
 AUTO_UPDATE_ENABLED = os.environ.get("HYDRASTREAMER_AUTO_UPDATE", "1").lower() not in {"0", "false", "no"}
@@ -784,9 +784,46 @@ class Handler(SimpleHTTPRequestHandler):
                     },
                 )
             self.path = f"/{key}/index.m3u8"
+            if start_time > 0:
+                return self.serve_offset_playlist(job)
             return self.serve_static()
 
         return self.serve_static()
+
+    def serve_offset_playlist(self, job):
+        # Réécrit la playlist d'un job démarré à -ss T pour qu'elle représente
+        # la timeline complète de la vidéo : le lecteur affiche la position
+        # absolue (ex. 20:00) au lieu de repartir à 0.
+        #  - EXT-X-PLAYLIST-TYPE:EVENT → la playlist est seekable partout (pas
+        #    de saut automatique vers le live edge)
+        #  - segments "virtuels" pour [0, T) (jamais téléchargés : la lecture
+        #    démarre à EXT-X-START:TIME-OFFSET=T et les seeks en arrière avant
+        #    T relancent un nouveau job côté frontend)
+        try:
+            text = job["playlist"].read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return text_response(self, 404, "playlist_not_found")
+
+        start = float(job.get("start_time") or 0)
+        seg_dur = 4.0  # hls_time du transcodage
+        virtual_count = int(start // seg_dur)
+
+        out = []
+        for line in text.splitlines():
+            if line.startswith("#EXTM3U") and "#EXT-X-PLAYLIST-TYPE" not in text:
+                out.append(line)
+                out.append("#EXT-X-PLAYLIST-TYPE:EVENT")
+                continue
+            if line.startswith("#EXTINF") and not any(
+                l.startswith("#EXT-X-START") for l in out
+            ):
+                out.append(f"#EXT-X-START:TIME-OFFSET={start:.3f}")
+                for _ in range(virtual_count):
+                    out.append(f"#EXTINF:{seg_dur:.6f},")
+                    out.append("/__virtual_skip__/seg.ts")
+            out.append(line)
+        body = "\n".join(out) + "\n"
+        return text_response(self, 200, body, "application/vnd.apple.mpegurl")
 
     def serve_static(self):
         parsed = urlparse(self.path)
