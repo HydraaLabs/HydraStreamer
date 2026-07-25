@@ -20,7 +20,7 @@ from urllib.request import Request, urlopen
 APP_NAME = "HydraStreamer"
 HOST = "127.0.0.1"
 PORT = 17654
-VERSION = "0.3.4"
+VERSION = "0.3.5"
 DEFAULT_UPDATE_MANIFEST_URL = "https://hydracker.com/hydrastreamer/releases/latest.json"
 UPDATE_MANIFEST_URL = os.environ.get("HYDRASTREAMER_UPDATE_URL", DEFAULT_UPDATE_MANIFEST_URL)
 AUTO_UPDATE_ENABLED = os.environ.get("HYDRASTREAMER_AUTO_UPDATE", "1").lower() not in {"0", "false", "no"}
@@ -30,6 +30,12 @@ JOBS = {}
 LOCK = threading.Lock()
 LOG_HANDLE = None
 IDLE_JOB_TTL_SECONDS = 900
+# Résilience du transcodage : la CDN (1Fichier) coupe régulièrement la
+# connexion HTTP en plein fichier ("stream ends prematurely"). Quand ffmpeg
+# meurt, on le relance depuis le dernier segment produit (-ss + -start_number
+# + append_list) pour continuer la MÊME playlist au lieu de tout recommencer.
+MAX_RESPAWNS_PER_JOB = 6
+RESPAWN_MIN_INTERVAL_SECONDS = 8
 # Hide console windows of child processes (ffmpeg, ffprobe, ...) on Windows,
 # required once the app itself is built without a console (--noconsole).
 CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
@@ -496,6 +502,77 @@ def job_key(url, audio_index, start_time, cookies=None):
     return hashlib.sha256(raw).hexdigest()[:24]
 
 
+def build_ffmpeg_cmd(ffmpeg, url, audio_index, start_time, cookies, out_dir, playlist, key, start_number=0, append=False):
+    cmd = [
+        ffmpeg,
+        "-hide_banner",
+        "-loglevel",
+        "warning",
+        "-reconnect",
+        "1",
+        "-reconnect_streamed",
+        "1",
+        "-reconnect_delay_max",
+        "5",
+    ]
+    if start_time > 0:
+        cmd.extend(["-ss", str(int(start_time))])
+    if cookies:
+        cmd.extend(["-cookies", cookies])
+    cmd.extend([
+        "-i",
+        url,
+        "-map",
+        "0:v:0",
+        "-map",
+        f"0:{audio_index}",
+        "-sn",
+        "-dn",
+        "-fflags",
+        "+genpts+discardcorrupt",
+        "-avoid_negative_ts",
+        "make_zero",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-tune",
+        "zerolatency",
+        "-g",
+        "48",
+        "-sc_threshold",
+        "0",
+        "-crf",
+        "23",
+        "-pix_fmt",
+        "yuv420p",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "160k",
+        "-ac",
+        "2",
+        "-f",
+        "hls",
+        "-hls_time",
+        "4",
+        "-hls_list_size",
+        "0",
+        "-hls_flags",
+        # append_list : le respawn continue la playlist existante au lieu de
+        # l'écraser (continuité du transcodage après une coupure CDN).
+        "independent_segments+append_list" if append else "independent_segments",
+        "-hls_base_url",
+        f"/{key}/",
+        "-start_number",
+        str(start_number),
+        "-hls_segment_filename",
+        str(out_dir / "seg_%05d.ts"),
+        str(playlist),
+    ])
+    return cmd
+
+
 def start_job(url, audio_index, start_time, cookies=None):
     ffmpeg = binary_path("ffmpeg")
     key = job_key(url, audio_index, start_time, cookies)
@@ -512,77 +589,16 @@ def start_job(url, audio_index, start_time, cookies=None):
         playlist = out_dir / "index.m3u8"
         log_file = out_dir / "ffmpeg.log"
 
-        cmd = [
-            ffmpeg,
-            "-hide_banner",
-            "-loglevel",
-            "warning",
-            "-reconnect",
-            "1",
-            "-reconnect_streamed",
-            "1",
-            "-reconnect_delay_max",
-            "5",
-        ]
-        if start_time > 0:
-            cmd.extend(["-ss", str(int(start_time))])
-        if cookies:
-            cmd.extend(["-cookies", cookies])
-        cmd.extend([
-            "-i",
-            url,
-            "-map",
-            "0:v:0",
-            "-map",
-            f"0:{audio_index}",
-            "-sn",
-            "-dn",
-            "-fflags",
-            "+genpts+discardcorrupt",
-            "-avoid_negative_ts",
-            "make_zero",
-            "-c:v",
-            "libx264",
-            "-preset",
-            "veryfast",
-            "-tune",
-            "zerolatency",
-            "-g",
-            "48",
-            "-sc_threshold",
-            "0",
-            "-crf",
-            "23",
-            "-pix_fmt",
-            "yuv420p",
-            "-c:a",
-            "aac",
-            "-b:a",
-            "160k",
-            "-ac",
-            "2",
-            "-f",
-            "hls",
-            "-hls_time",
-            "4",
-            "-hls_list_size",
-            "0",
-            "-hls_flags",
-            "independent_segments",
-            "-hls_base_url",
-            f"/{key}/",
-            "-start_number",
-            "0",
-            "-hls_segment_filename",
-            str(out_dir / "seg_%05d.ts"),
-            str(playlist),
-        ])
+        cmd = build_ffmpeg_cmd(
+            ffmpeg, url, audio_index, start_time, cookies, out_dir, playlist, key,
+        )
         log = open(log_file, "ab")
         process = subprocess.Popen(cmd, stdout=log, stderr=log, creationflags=CREATE_NO_WINDOW)
         job = {
             "url": url,
             "audio_index": audio_index,
             "start_time": start_time,
+            "cookies": cookies,
             "dir": out_dir,
             "playlist": playlist,
             "log_file": log_file,
@@ -591,6 +607,53 @@ def start_job(url, audio_index, start_time, cookies=None):
         }
         JOBS[key] = job
         return key, job
+
+
+def job_playlist_complete(job):
+    try:
+        return job["playlist"].exists() and "#EXT-X-ENDLIST" in job["playlist"].read_text(errors="replace")
+    except OSError:
+        return False
+
+
+def respawn_job(key, job):
+    # Reprend le transcodage au segment suivant le dernier produit, en
+    # continuant la même playlist (-start_number + append_list).
+    next_index = len(list(job["dir"].glob("seg_*.ts")))
+    resume = int(job["start_time"]) + next_index * 4
+    ffmpeg = binary_path("ffmpeg")
+    cmd = build_ffmpeg_cmd(
+        ffmpeg, job["url"], job["audio_index"], resume, job.get("cookies"),
+        job["dir"], job["playlist"], key, start_number=next_index, append=True,
+    )
+    log = open(job["log_file"], "ab")
+    with LOCK:
+        job["process"] = subprocess.Popen(cmd, stdout=log, stderr=log, creationflags=CREATE_NO_WINDOW)
+        job["last_access"] = time.time()
+    print(f"[hydra-streamer] respawn job {key} au segment {next_index} (-ss {resume})")
+
+
+def watchdog_loop():
+    while True:
+        time.sleep(5)
+        with LOCK:
+            items = list(JOBS.items())
+        for key, job in items:
+            process = job.get("process")
+            if process is not None and process.poll() is None:
+                continue
+            if job_playlist_complete(job):
+                continue
+            now = time.time()
+            with LOCK:
+                attempts = int(job.get("respawns", 0))
+                if attempts >= MAX_RESPAWNS_PER_JOB:
+                    continue
+                if now - float(job.get("last_respawn") or 0) < RESPAWN_MIN_INTERVAL_SECONDS:
+                    continue
+                job["respawns"] = attempts + 1
+                job["last_respawn"] = now
+            respawn_job(key, job)
 
 
 def throttle_forward(host):
@@ -945,6 +1008,7 @@ def main():
     binary_path("ffprobe")
 
     threading.Thread(target=cleanup_loop, daemon=True).start()
+    threading.Thread(target=watchdog_loop, daemon=True).start()
     threading.Thread(target=update_loop, daemon=True).start()
 
     httpd = ThreadingHTTPServer((args.host, args.port), Handler)
