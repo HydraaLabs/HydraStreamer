@@ -13,6 +13,7 @@ python -m pip install -r requirements-build.txt
 pyinstaller \
   --clean \
   --onefile \
+  --noconsole \
   --name HydraStreamer \
   hydra_streamer.py
 

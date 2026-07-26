@@ -60,6 +60,7 @@ Restart=always
 RestartSec=3
 DynamicUser=yes
 LogsDirectory=hydrastreamer
+CacheDirectory=hydrastreamer
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=full

@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import platform
+import re
 import sys
 import shutil
 import subprocess
@@ -20,7 +21,7 @@ from urllib.request import Request, urlopen
 APP_NAME = "HydraStreamer"
 HOST = "127.0.0.1"
 PORT = 17654
-VERSION = "0.3.5"
+VERSION = "0.4.0"
 DEFAULT_UPDATE_MANIFEST_URL = "https://hydracker.com/hydrastreamer/releases/latest.json"
 UPDATE_MANIFEST_URL = os.environ.get("HYDRASTREAMER_UPDATE_URL", DEFAULT_UPDATE_MANIFEST_URL)
 AUTO_UPDATE_ENABLED = os.environ.get("HYDRASTREAMER_AUTO_UPDATE", "1").lower() not in {"0", "false", "no"}
@@ -34,8 +35,29 @@ IDLE_JOB_TTL_SECONDS = 900
 # connexion HTTP en plein fichier ("stream ends prematurely"). Quand ffmpeg
 # meurt, on le relance depuis le dernier segment produit (-ss + -start_number
 # + append_list) pour continuer la MÊME playlist au lieu de tout recommencer.
-MAX_RESPAWNS_PER_JOB = 6
+# Le transcodage suit un téléchargement en cours : ffmpeg atteint l'EOF du
+# fichier partiel, meurt, et le watchdog le relance quand le fichier a
+# grandi — cap élevé tant que le download progresse.
+MAX_RESPAWNS_PER_JOB = 60
 RESPAWN_MIN_INTERVAL_SECONDS = 8
+
+# ─── Cache de téléchargement ─────────────────────────────────────────────────
+# Plutôt que de transcoder depuis l'URL CDN (coupures + expiration), on
+# télécharge le fichier dans un répertoire de cache avec reprise, puis on
+# transcode depuis le disque (y compris pendant que le fichier se télécharge
+# encore — lecture d'un MKV qui grandit). Le cache est réutilisé entre
+# sessions (re-visionnage instantané) et géré en LRU.
+# /var/cache/hydrastreamer (systemd CacheDirectory) : persiste aux restarts
+# et upgrades du service, contrairement à /tmp sous PrivateTmp.
+CACHE_DIR = Path(os.environ.get(
+    "HYDRASTREAMER_CACHE_DIR",
+    "/var/cache/hydrastreamer" if os.name != "nt" else str(ROOT / "cache"),
+))
+CACHE_MAX_BYTES = 20 * 1024 ** 3          # plafond global du cache (20 Go)
+CACHE_TTL_SECONDS = 24 * 3600             # durée de vie d'un fichier caché
+DOWNLOAD_MIN_BYTES = 16 * 1024 * 1024     # minimum avant de lancer ffmpeg
+DOWNLOAD_WAIT_SECONDS = 90                # attente max du minimum téléchargé
+DOWNLOAD_MAX_ATTEMPTS = 20
 # Hide console windows of child processes (ffmpeg, ffprobe, ...) on Windows,
 # required once the app itself is built without a console (--noconsole).
 CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
@@ -502,19 +524,233 @@ def job_key(url, audio_index, start_time, cookies=None):
     return hashlib.sha256(raw).hexdigest()[:24]
 
 
+# Code hébergeur : `/?CODE` (20-24 alphanumériques). Utilisé par le frontend
+# pour décider de passer `file=` (clé de cache stable) — les URLs CDN
+# (`a-14.1fichier.com/p2157…`) n'ont pas de `/?` → rejetées naturellement.
+SHARE_CODE_RE = re.compile(r"/\?([a-zA-Z0-9]{20,24})(?:&|$)")
+
+
+def ensure_virtual_segment():
+    # Segment TS valide (4s noir + silence) servi pour les entrées
+    # "virtuelles" des playlists offset (région [0, T) non transcodée) —
+    # hls.js les télécharge parfois (alignement, prefetch) et un 404 serait
+    # fatal à la lecture.
+    target = ROOT / "__virtual_skip__" / "seg.ts"
+    if target.exists():
+        return target
+    target.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        ffmpeg = binary_path("ffmpeg")
+        subprocess.run([
+            ffmpeg, "-hide_banner", "-loglevel", "error",
+            "-f", "lavfi", "-i", "color=black:s=320x240:r=25:d=4",
+            "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo:d=4",
+            "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-shortest", "-f", "mpegts", str(target),
+        ], timeout=60, capture_output=True, creationflags=CREATE_NO_WINDOW)
+    except Exception:
+        pass
+    return target if target.exists() else None
+
+
+def cache_key_for(url, file_hint=None, lien_id=None):
+    # Nom du fichier cache : l'ID du lien quand il est fourni (identifiant
+    # stable, survit aux re-résolutions et aux changements de domaine),
+    # sinon md5(url)[:20]. JAMAIS l'URL CDN seule en présence d'un id/hint.
+    if lien_id:
+        safe = re.sub(r"[^a-zA-Z0-9_-]", "", str(lien_id))[:32]
+        if safe:
+            return f"lien-{safe}"
+    basis = file_hint or url
+    return hashlib.md5(basis.encode("utf-8")).hexdigest()[:20]
+
+
+def total_size_for(url, cookies=None):
+    # Taille totale du fichier distant : HEAD d'abord, sinon une requête
+    # Range d'1 octet (certaines CDN refusent HEAD mais répondent à Range).
+    def run(cmd):
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=20, creationflags=CREATE_NO_WINDOW)
+
+    head_cmd = ["curl", "-fsSIL", "--max-time", "15"]
+    if cookies:
+        head_cmd.extend(["-b", cookies])
+    head_cmd.append(url)
+    out = run(head_cmd).stdout or ""
+    for line in out.splitlines():
+        if line.lower().startswith("content-length:"):
+            try:
+                return int(line.split(":", 1)[1].strip())
+            except ValueError:
+                pass
+    range_cmd = ["curl", "-fsSL", "--max-time", "15", "-r", "0-0", "-o", os.devnull, "-w", "%{http_code} %header{content-range}"]
+    if cookies:
+        range_cmd.extend(["-b", cookies])
+    range_cmd.append(url)
+    out = run(range_cmd).stdout or ""
+    match = re.search(r"/(\d+)\s*$", out)
+    return int(match.group(1)) if match else 0
+
+
+def download_file(url, part_path, final_path, state, cookies=None):
+    # Télécharge avec reprise (Range) en boucle jusqu'au fichier complet.
+    # curl -C - reprend à la taille du .part existant ; --fail stoppe net sur
+    # erreur HTTP (URL expirée → inutile de réessayer).
+    state["total_bytes"] = total_size_for(url, cookies)
+    for attempt in range(DOWNLOAD_MAX_ATTEMPTS):
+        if state.get("cancelled") or final_path.exists():
+            return final_path.exists()
+        cmd = [
+            "curl", "-fSL", "--silent", "--show-error",
+            "--retry", "3", "--retry-delay", "2", "--retry-all-errors",
+            "-C", "-", "-o", str(part_path),
+        ]
+        if cookies:
+            cmd.extend(["-b", cookies])
+        cmd.append(url)
+        try:
+            proc = subprocess.run(cmd, timeout=7200, creationflags=CREATE_NO_WINDOW)
+        except subprocess.TimeoutExpired:
+            proc = None
+        if proc is not None and proc.returncode == 0 and part_path.exists():
+            part_path.replace(final_path)
+            return True
+        if proc is not None and proc.returncode == 22:
+            # Erreur HTTP définitive (403/404) — l'URL est morte.
+            state["error"] = "http_error"
+            return False
+        state["error"] = "network_error"
+        time.sleep(min(30, 2 ** min(attempt, 4)))
+    return False
+
+
+def cache_maintenance():
+    # TTL + LRU : supprime les fichiers expirés, puis les plus anciens tant
+    # que le cache dépasse le plafond. Ne touche pas aux fichiers en cours de
+    # téléchargement (.part récents).
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    now = time.time()
+    files = []
+    total = 0
+    for path in CACHE_DIR.iterdir():
+        if path.suffix == ".part":
+            continue
+        try:
+            st = path.stat()
+        except OSError:
+            continue
+        files.append((st.st_mtime, st.st_size, path))
+        total += st.st_size
+    for mtime, size, path in files:
+        if now - mtime > CACHE_TTL_SECONDS:
+            path.unlink(missing_ok=True)
+            total -= size
+    for mtime, size, path in sorted(files):
+        if total <= CACHE_MAX_BYTES:
+            break
+        if path.exists():
+            path.unlink(missing_ok=True)
+            total -= size
+
+
+DOWNLOADS = {}
+
+
+def start_download(url, cache_name, cookies=None):
+    # Lance (ou réutilise) LE téléchargement du fichier en cache — un seul
+    # downloader par fichier, jamais d'écrivains concurrents sur le .part
+    # (corruption + bans CDN). Retourne (final_path, state).
+    final_path = CACHE_DIR / f"{cache_name}.bin"
+    part_path = CACHE_DIR / f"{cache_name}.part"
+    with LOCK:
+        if final_path.exists():
+            return final_path, {"cancelled": False, "error": None, "done": True}
+        existing = DOWNLOADS.get(cache_name)
+        if existing:
+            state = existing["state"]
+            # URL morte (403) mais nouvelle URL fournie (re-résolution) → on
+            # relance avec la nouvelle URL, en reprenant le .part existant.
+            if state.get("error") == "http_error" and url != state.get("url"):
+                state["error"] = None
+                state["url"] = url
+                state["cancelled"] = True  # stoppe l'ancienne boucle
+                cookies_to_use = cookies
+                DOWNLOADS.pop(cache_name, None)
+            else:
+                return final_path, state
+        state = {"cancelled": False, "error": None, "done": False, "url": url}
+        DOWNLOADS[cache_name] = {"state": state}
+        cookies_to_use = cookies
+
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+    def run():
+        ok = download_file(state["url"], part_path, final_path, state, cookies_to_use)
+        state["done"] = ok
+        with LOCK:
+            if DOWNLOADS.get(cache_name, {}).get("state") is state:
+                DOWNLOADS.pop(cache_name, None)
+
+    threading.Thread(target=run, daemon=True).start()
+    return final_path, state
+
+
+def wait_for_data(path, state, minimum=DOWNLOAD_MIN_BYTES, timeout=DOWNLOAD_WAIT_SECONDS):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if state.get("done") or state.get("error"):
+            break
+        current = path if path.exists() else path.with_suffix(".part")
+        try:
+            if current.exists() and current.stat().st_size >= minimum:
+                return True
+        except OSError:
+            pass
+        time.sleep(0.5)
+    return False
+
+
+def bytes_needed_for(total, duration, sec):
+    # Octets nécessaires pour lire à la position `sec` (proportion + marge).
+    if total <= 0 or duration <= 0 or sec <= 0:
+        return DOWNLOAD_MIN_BYTES
+    return int(total * min(0.99, sec / duration)) + 8 * 1024 * 1024
+
+
+def coverage_needed(state, start_time, partial_path):
+    # Octets nécessaires avant de pouvoir démarrer ffmpeg à -ss start_time :
+    # la position de reprise doit être couverte par le téléchargement.
+    # Estimation par proportion (durée ffprobe sur le header MKV, taille
+    # totale via HEAD/Range), avec marge de 8 Mo.
+    total = state.get("total_bytes") or 0
+    if total <= 0 or start_time <= 0:
+        return DOWNLOAD_MIN_BYTES
+    if not state.get("duration"):
+        try:
+            info = probe(str(partial_path)) if partial_path.exists() else None
+            state["duration"] = float((info or {}).get("duration") or 0)
+        except Exception:
+            state["duration"] = 0
+    needed = bytes_needed_for(total, float(state.get("duration") or 0), start_time)
+    return max(DOWNLOAD_MIN_BYTES, needed)
+
+
 def build_ffmpeg_cmd(ffmpeg, url, audio_index, start_time, cookies, out_dir, playlist, key, start_number=0, append=False):
     cmd = [
         ffmpeg,
         "-hide_banner",
         "-loglevel",
         "warning",
-        "-reconnect",
-        "1",
-        "-reconnect_streamed",
-        "1",
-        "-reconnect_delay_max",
-        "5",
     ]
+    # Options réseau uniquement (invalides sur une entrée fichier locale).
+    if str(url).startswith(("http://", "https://")):
+        cmd.extend([
+            "-reconnect",
+            "1",
+            "-reconnect_streamed",
+            "1",
+            "-reconnect_delay_max",
+            "5",
+        ])
     if start_time > 0:
         cmd.extend(["-ss", str(int(start_time))])
     if cookies:
@@ -573,14 +809,39 @@ def build_ffmpeg_cmd(ffmpeg, url, audio_index, start_time, cookies, out_dir, pla
     return cmd
 
 
-def start_job(url, audio_index, start_time, cookies=None):
+def start_job(url, audio_index, start_time, cookies=None, file_hint=None, lien_id=None):
     ffmpeg = binary_path("ffmpeg")
+
+    # Télécharge d'abord dans le cache (reprise automatique), puis transcode
+    # depuis le disque — même pendant que le fichier grandit. Si la position
+    # demandée (>0) n'est pas couverte par le cache, on démarre au début.
+    cache_name = cache_key_for(url, file_hint, lien_id)
+    cache_file, dl_state = start_download(url, cache_name, cookies)
+    if not dl_state.get("done") and start_time > 0:
+        partial = cache_file.with_suffix(".part")
+        try:
+            current = partial.stat().st_size if partial.exists() else (
+                cache_file.stat().st_size if cache_file.exists() else 0
+            )
+        except OSError:
+            current = 0
+        if current < coverage_needed(dl_state, start_time, partial):
+            start_time = 0
+
     key = job_key(url, audio_index, start_time, cookies)
     with LOCK:
         existing = JOBS.get(key)
         if existing and existing["process"].poll() is None:
             existing["last_access"] = time.time()
             return key, existing
+
+        # Attend le minimum de données pour lancer ffmpeg (fichier complet ou
+        # DOWNLOAD_MIN_BYTES du partiel — le watchdog le fait suivre ensuite).
+        if not dl_state.get("done"):
+            wait_for_data(cache_file, dl_state)
+        input_path = cache_file if cache_file.exists() else cache_file.with_suffix(".part")
+        if not input_path.exists():
+            raise RuntimeError(f"download_failed: {dl_state.get('error') or 'no_data'}")
 
         out_dir = ROOT / key
         if out_dir.exists():
@@ -590,7 +851,7 @@ def start_job(url, audio_index, start_time, cookies=None):
         log_file = out_dir / "ffmpeg.log"
 
         cmd = build_ffmpeg_cmd(
-            ffmpeg, url, audio_index, start_time, cookies, out_dir, playlist, key,
+            ffmpeg, str(input_path), audio_index, start_time, None, out_dir, playlist, key,
         )
         log = open(log_file, "ab")
         process = subprocess.Popen(cmd, stdout=log, stderr=log, creationflags=CREATE_NO_WINDOW)
@@ -599,6 +860,11 @@ def start_job(url, audio_index, start_time, cookies=None):
             "audio_index": audio_index,
             "start_time": start_time,
             "cookies": cookies,
+            "input_path": str(input_path),
+            "cache_file": str(cache_file),
+            "download": dl_state,
+            "total_bytes": int(dl_state.get("total_bytes") or 0),
+            "duration": float(dl_state.get("duration") or 0),
             "dir": out_dir,
             "playlist": playlist,
             "log_file": log_file,
@@ -623,7 +889,7 @@ def respawn_job(key, job):
     resume = int(job["start_time"]) + next_index * 4
     ffmpeg = binary_path("ffmpeg")
     cmd = build_ffmpeg_cmd(
-        ffmpeg, job["url"], job["audio_index"], resume, job.get("cookies"),
+        ffmpeg, job.get("input_path") or job["url"], job["audio_index"], resume, None,
         job["dir"], job["playlist"], key, start_number=next_index, append=True,
     )
     log = open(job["log_file"], "ab")
@@ -651,6 +917,40 @@ def watchdog_loop():
                     continue
                 if now - float(job.get("last_respawn") or 0) < RESPAWN_MIN_INTERVAL_SECONDS:
                     continue
+                # Téléchargement en cours : ne respawn que si le fichier a
+                # grandi depuis la dernière tentative ET couvre la position
+                # de reprise (sinon ffmpeg meurt immédiatement au même EOF
+                # partiel, ou ne trouve aucune frame au -ss demandé).
+                dl = job.get("download") or {}
+                if dl and not dl.get("done"):
+                    if dl.get("error"):
+                        continue
+                    current_size = 0
+                    try:
+                        cache_file = Path(job.get("cache_file") or "")
+                        partial = cache_file if cache_file.exists() else cache_file.with_suffix(".part")
+                        current_size = partial.stat().st_size if partial.exists() else 0
+                    except OSError:
+                        current_size = 0
+                    if current_size <= int(job.get("last_size", 0)) + 2 * 1024 * 1024:
+                        continue
+                    # Durée encore inconnue (fichier trop petit à la création
+                    # du job) : on la re-sonde maintenant qu'il y a de la data.
+                    if not job.get("duration") and current_size >= DOWNLOAD_MIN_BYTES:
+                        try:
+                            info = probe(str(partial))
+                            job["duration"] = float((info or {}).get("duration") or 0)
+                        except Exception:
+                            pass
+                    segs_done = len(list(job["dir"].glob("seg_*.ts")))
+                    resume_sec = int(job["start_time"]) + segs_done * 4
+                    if current_size < bytes_needed_for(
+                        int(job.get("total_bytes") or 0),
+                        float(job.get("duration") or 0),
+                        resume_sec,
+                    ):
+                        continue
+                    job["last_size"] = current_size
                 job["respawns"] = attempts + 1
                 job["last_respawn"] = now
             respawn_job(key, job)
@@ -784,10 +1084,44 @@ class Handler(SimpleHTTPRequestHandler):
         if parsed.path == "/probe":
             url = first(params, "url")
             cookies = first(params, "cookies")
+            file_hint = first(params, "file")
+            lien_id = first(params, "id")
             if not valid_url(url):
                 return json_response(self, 400, {"error": "invalid_url"})
             try:
-                result = probe(url, cookies)
+                # Résultat de probe caché par fichier (clé lien) : le contenu
+                # ne change jamais → on évite de re-télécharger/re-prober.
+                cache_name = cache_key_for(url, file_hint or None, lien_id or None)
+                probe_cache = CACHE_DIR / f"{cache_name}.probe.json"
+                if probe_cache.exists():
+                    try:
+                        cached_result = json.loads(probe_cache.read_text(encoding="utf-8"))
+                        return json_response(self, 200, cached_result)
+                    except (OSError, ValueError):
+                        probe_cache.unlink(missing_ok=True)
+
+                # Probe depuis le cache quand il est déjà là (re-lecture
+                # instantanée) ; sinon démarre le téléchargement et probe le
+                # fichier partiel — jamais l'URL directement (expiration,
+                # rate-limit CDN → le player retombait en lecture directe).
+                probe_input = url
+                cached = CACHE_DIR / f"{cache_name}.bin"
+                if cached.exists():
+                    probe_input = str(cached)
+                    cookies = None
+                else:
+                    cache_file, dl_state = start_download(url, cache_name, cookies)
+                    wait_for_data(cache_file, dl_state, minimum=4 * 1024 * 1024, timeout=30)
+                    partial = cache_file if cache_file.exists() else cache_file.with_suffix(".part")
+                    if partial.exists():
+                        probe_input = str(partial)
+                        cookies = None
+                result = probe(probe_input, cookies)
+                try:
+                    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+                    probe_cache.write_text(json.dumps(result), encoding="utf-8")
+                except OSError:
+                    pass
                 print(
                     "[hydra-streamer] probe:",
                     f"duration={result.get('duration')}",
@@ -802,6 +1136,8 @@ class Handler(SimpleHTTPRequestHandler):
             audio = first(params, "audio") or "1"
             start = first(params, "start") or "0"
             cookies = first(params, "cookies")
+            file_hint = first(params, "file")
+            lien_id = first(params, "id")
             if not valid_url(url):
                 return json_response(self, 400, {"error": "invalid_url"})
             try:
@@ -814,7 +1150,7 @@ class Handler(SimpleHTTPRequestHandler):
                 return json_response(self, 400, {"error": "invalid_start"})
 
             try:
-                key, job = start_job(url, audio_index, start_time, cookies)
+                key, job = start_job(url, audio_index, start_time, cookies, file_hint=file_hint or None, lien_id=lien_id or None)
             except Exception as exc:
                 return json_response(self, 500, {"error": str(exc)})
 
@@ -898,6 +1234,24 @@ class Handler(SimpleHTTPRequestHandler):
         target = (ROOT / rel).resolve()
         if not str(target).startswith(str(ROOT.resolve())):
             return text_response(self, 403, "forbidden")
+        # Segment pas encore produit (transcode derrière le téléchargement) :
+        # on attend qu'il apparaisse au lieu de renvoyer un 404 fatal au
+        # player. Timeout borné — le watchdog ffmpeg fait le reste.
+        if target.suffix == ".ts" and not target.exists() and key in JOBS:
+            deadline = time.time() + 60
+            while time.time() < deadline and not target.exists():
+                with LOCK:
+                    job = JOBS.get(key)
+                if job is None:
+                    break
+                proc = job.get("process")
+                dl = job.get("download") or {}
+                # Stoppe l'attente si plus rien ne produira le segment.
+                if (proc is None or proc.poll() is not None) and job_playlist_complete(job):
+                    break
+                if dl.get("error"):
+                    break
+                time.sleep(0.25)
         if target.suffix == ".m3u8":
             self.extensions_map[".m3u8"] = "application/vnd.apple.mpegurl"
         elif target.suffix == ".ts":
@@ -961,8 +1315,15 @@ def cleanup_loop():
                 # (sinon la lecture repart au début en plein milieu).
                 if expired:
                     stop_process(process)
+                    if job.get("download"):
+                        job["download"]["cancelled"] = True
                     shutil.rmtree(job.get("dir"), ignore_errors=True)
                     JOBS.pop(key, None)
+        # Maintenance du cache de téléchargement (TTL 24 h + LRU 20 Go).
+        try:
+            cache_maintenance()
+        except Exception:
+            pass
 
 
 def update_loop():
@@ -1006,6 +1367,7 @@ def main():
 
     binary_path("ffmpeg")
     binary_path("ffprobe")
+    ensure_virtual_segment()
 
     threading.Thread(target=cleanup_loop, daemon=True).start()
     threading.Thread(target=watchdog_loop, daemon=True).start()
