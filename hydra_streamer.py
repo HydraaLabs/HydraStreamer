@@ -21,7 +21,7 @@ from urllib.request import Request, urlopen
 APP_NAME = "HydraStreamer"
 HOST = "127.0.0.1"
 PORT = 17654
-VERSION = "0.4.0"
+VERSION = "0.4.1"
 DEFAULT_UPDATE_MANIFEST_URL = "https://hydracker.com/hydrastreamer/releases/latest.json"
 UPDATE_MANIFEST_URL = os.environ.get("HYDRASTREAMER_UPDATE_URL", DEFAULT_UPDATE_MANIFEST_URL)
 AUTO_UPDATE_ENABLED = os.environ.get("HYDRASTREAMER_AUTO_UPDATE", "1").lower() not in {"0", "false", "no"}
@@ -519,8 +519,14 @@ def safe_asset_info(asset):
     }
 
 
-def job_key(url, audio_index, start_time, cookies=None):
-    raw = f"{url}\n{audio_index}\n{int(start_time)}\n{cookies or ''}".encode("utf-8")
+def job_key(url, audio_index, start_time, cookies=None, lien_id=None):
+    # La clé du job HLS identifie le CONTENU, pas l'URL CDN (qui change à
+    # chaque re-résolution) : avec un lien id, une re-résolution réutilise le
+    # MÊME job et la playlist continue au lieu de repartir à seg_00000.
+    if lien_id:
+        raw = f"lien:{lien_id}\n{audio_index}\n{int(start_time)}".encode("utf-8")
+    else:
+        raw = f"{url}\n{audio_index}\n{int(start_time)}\n{cookies or ''}".encode("utf-8")
     return hashlib.sha256(raw).hexdigest()[:24]
 
 
@@ -828,15 +834,23 @@ def start_job(url, audio_index, start_time, cookies=None, file_hint=None, lien_i
         if current < coverage_needed(dl_state, start_time, partial):
             start_time = 0
 
-    key = job_key(url, audio_index, start_time, cookies)
+    key = job_key(url, audio_index, start_time, cookies, lien_id)
     with LOCK:
         existing = JOBS.get(key)
-        if existing and existing["process"].poll() is None:
+        if existing:
             existing["last_access"] = time.time()
-            return key, existing
-
-        # Attend le minimum de données pour lancer ffmpeg (fichier complet ou
-        # DOWNLOAD_MIN_BYTES du partiel — le watchdog le fait suivre ensuite).
+            if existing["process"].poll() is None:
+                return key, existing
+            # Processus mort : ne JAMAIS effacer un job qui a déjà produit
+            # des segments — le watchdog le relance avec append_list (sinon
+            # la playlist repart à seg_00000 et le player rembobine à 0 à
+            # chaque polling de playlist). Recréation à zéro seulement si
+            # rien n'a été produit ET le téléchargement est mort.
+            has_segments = any(existing["dir"].glob("seg_*.ts"))
+            dl = existing.get("download") or {}
+            if has_segments or not dl.get("error"):
+                return key, existing
+        # pas de job, ou job vide dont le téléchargement a échoué → recréation
         if not dl_state.get("done"):
             wait_for_data(cache_file, dl_state)
         input_path = cache_file if cache_file.exists() else cache_file.with_suffix(".part")
@@ -1117,11 +1131,26 @@ class Handler(SimpleHTTPRequestHandler):
                         probe_input = str(partial)
                         cookies = None
                 result = probe(probe_input, cookies)
-                try:
-                    CACHE_DIR.mkdir(parents=True, exist_ok=True)
-                    probe_cache.write_text(json.dumps(result), encoding="utf-8")
-                except OSError:
-                    pass
+                # Header MKV pas encore téléchargé (pistes vides) : attendre
+                # plus de données et re-sonder une fois avant de répondre.
+                if (
+                    not result.get("video")
+                    and not result.get("audio")
+                    and not cached.exists()
+                    and Path(probe_input).suffix == ".part"
+                ):
+                    wait_for_data(cache_file, dl_state, minimum=32 * 1024 * 1024, timeout=30)
+                    if partial.exists() and partial.stat().st_size > 4 * 1024 * 1024:
+                        result = probe(str(partial), None)
+                # Ne met en cache que les probes COMPLETS (pistes trouvées) —
+                # un probe sur fichier partiel peut ne voir aucune piste et
+                # ne doit pas être figé pour les lectures suivantes.
+                if result.get("video") or result.get("audio"):
+                    try:
+                        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+                        probe_cache.write_text(json.dumps(result), encoding="utf-8")
+                    except OSError:
+                        pass
                 print(
                     "[hydra-streamer] probe:",
                     f"duration={result.get('duration')}",
