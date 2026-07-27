@@ -21,7 +21,7 @@ from urllib.request import Request, urlopen
 APP_NAME = "HydraStreamer"
 HOST = "127.0.0.1"
 PORT = 17654
-VERSION = "0.4.1"
+VERSION = "0.4.3"
 DEFAULT_UPDATE_MANIFEST_URL = "https://hydracker.com/hydrastreamer/releases/latest.json"
 UPDATE_MANIFEST_URL = os.environ.get("HYDRASTREAMER_UPDATE_URL", DEFAULT_UPDATE_MANIFEST_URL)
 AUTO_UPDATE_ENABLED = os.environ.get("HYDRASTREAMER_AUTO_UPDATE", "1").lower() not in {"0", "false", "no"}
@@ -57,6 +57,7 @@ CACHE_MAX_BYTES = 20 * 1024 ** 3          # plafond global du cache (20 Go)
 CACHE_TTL_SECONDS = 24 * 3600             # durée de vie d'un fichier caché
 DOWNLOAD_MIN_BYTES = 16 * 1024 * 1024     # minimum avant de lancer ffmpeg
 DOWNLOAD_WAIT_SECONDS = 90                # attente max du minimum téléchargé
+PROBE_DOWNLOAD_WAIT_SECONDS = 3600        # MP4 non-faststart : attente max du download complet avant probe
 DOWNLOAD_MAX_ATTEMPTS = 20
 # Hide console windows of child processes (ffmpeg, ffprobe, ...) on Windows,
 # required once the app itself is built without a console (--noconsole).
@@ -600,7 +601,10 @@ def total_size_for(url, cookies=None):
 def download_file(url, part_path, final_path, state, cookies=None):
     # Télécharge avec reprise (Range) en boucle jusqu'au fichier complet.
     # curl -C - reprend à la taille du .part existant ; --fail stoppe net sur
-    # erreur HTTP (URL expirée → inutile de réessayer).
+    # erreur HTTP (URL expirée → inutile de réessayer). Le process curl
+    # courant est référencé dans state["proc"] pour qu'une annulation
+    # (/cancel-download, expiration de job) puisse le tuer immédiatement —
+    # sinon le flag cancelled n'agirait qu'après la fin du curl en cours.
     state["total_bytes"] = total_size_for(url, cookies)
     for attempt in range(DOWNLOAD_MAX_ATTEMPTS):
         if state.get("cancelled") or final_path.exists():
@@ -614,9 +618,21 @@ def download_file(url, part_path, final_path, state, cookies=None):
             cmd.extend(["-b", cookies])
         cmd.append(url)
         try:
-            proc = subprocess.run(cmd, timeout=7200, creationflags=CREATE_NO_WINDOW)
-        except subprocess.TimeoutExpired:
+            proc = subprocess.Popen(cmd, creationflags=CREATE_NO_WINDOW)
+            state["proc"] = proc
+            try:
+                proc.wait(timeout=7200)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+        except OSError:
             proc = None
+        finally:
+            state["proc"] = None
+        if state.get("cancelled"):
+            # Annulé : le .part reste sur disque (reprise possible), le
+            # worker cache_maintenance le supprime après le TTL.
+            return False
         if proc is not None and proc.returncode == 0 and part_path.exists():
             part_path.replace(final_path)
             return True
@@ -639,6 +655,15 @@ def cache_maintenance():
     total = 0
     for path in CACHE_DIR.iterdir():
         if path.suffix == ".part":
+            # .part orphelins (download annulé, daemon stoppé, etc.) :
+            # supprimés après le TTL comme le reste — un téléchargement
+            # actif a un mtime récent et n'est jamais concerné. Les .part
+            # restent exclus du LRU (reprise possible après une coupure).
+            try:
+                if now - path.stat().st_mtime > CACHE_TTL_SECONDS:
+                    path.unlink(missing_ok=True)
+            except OSError:
+                pass
             continue
         try:
             st = path.stat()
@@ -661,6 +686,19 @@ def cache_maintenance():
 DOWNLOADS = {}
 
 
+def cancel_download_state(state):
+    # Annulation immédiate : flag + kill du curl en cours (le .part est
+    # conservé pour une éventuelle reprise ; cache_maintenance le supprime
+    # après le TTL).
+    state["cancelled"] = True
+    proc = state.get("proc")
+    if proc is not None and proc.poll() is None:
+        try:
+            proc.terminate()
+        except OSError:
+            pass
+
+
 def start_download(url, cache_name, cookies=None):
     # Lance (ou réutilise) LE téléchargement du fichier en cache — un seul
     # downloader par fichier, jamais d'écrivains concurrents sur le .part
@@ -669,6 +707,8 @@ def start_download(url, cache_name, cookies=None):
     part_path = CACHE_DIR / f"{cache_name}.part"
     with LOCK:
         if final_path.exists():
+            print(f"[hydra-streamer] cache hit: {cache_name}.bin "
+                  f"({final_path.stat().st_size // (1024 * 1024)} Mo)")
             return final_path, {"cancelled": False, "error": None, "done": True}
         existing = DOWNLOADS.get(cache_name)
         if existing:
@@ -678,20 +718,34 @@ def start_download(url, cache_name, cookies=None):
             if state.get("error") == "http_error" and url != state.get("url"):
                 state["error"] = None
                 state["url"] = url
-                state["cancelled"] = True  # stoppe l'ancienne boucle
+                cancel_download_state(state)  # stoppe l'ancienne boucle
                 cookies_to_use = cookies
                 DOWNLOADS.pop(cache_name, None)
             else:
+                print(f"[hydra-streamer] fetch déjà en cours: {cache_name} (partagé)")
                 return final_path, state
         state = {"cancelled": False, "error": None, "done": False, "url": url}
         DOWNLOADS[cache_name] = {"state": state}
         cookies_to_use = cookies
 
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        resume_at = part_path.stat().st_size if part_path.exists() else 0
+    except OSError:
+        resume_at = 0
+    if resume_at > 0:
+        print(f"[hydra-streamer] fetch (reprise à {resume_at // (1024 * 1024)} Mo): {cache_name} ← {url[:80]}")
+    else:
+        print(f"[hydra-streamer] fetch: {cache_name} ← {url[:80]}")
 
     def run():
         ok = download_file(state["url"], part_path, final_path, state, cookies_to_use)
         state["done"] = ok
+        if ok:
+            print(f"[hydra-streamer] fetch terminé: {cache_name}.bin "
+                  f"({final_path.stat().st_size // (1024 * 1024)} Mo)")
+        elif state.get("error"):
+            print(f"[hydra-streamer] fetch erreur ({state['error']}): {cache_name}")
         with LOCK:
             if DOWNLOADS.get(cache_name, {}).get("state") is state:
                 DOWNLOADS.pop(cache_name, None)
@@ -1095,6 +1149,24 @@ class Handler(SimpleHTTPRequestHandler):
                 },
             )
 
+        if parsed.path == "/cancel-download":
+            # Annule le téléchargement cache d'une source désélectionnée :
+            # le curl est tué, le .part est CONSERVÉ (reprise possible) et
+            # sera supprimé par cache_maintenance après le TTL (24 h).
+            url = first(params, "url") or ""
+            file_hint = first(params, "file")
+            lien_id = first(params, "id")
+            if not lien_id and not (url and valid_url(url)):
+                return json_response(self, 400, {"error": "invalid_params"})
+            cache_name = cache_key_for(url, file_hint or None, lien_id or None)
+            with LOCK:
+                entry = DOWNLOADS.get(cache_name)
+            if not entry:
+                return json_response(self, 200, {"ok": True, "cancelled": False, "cache": cache_name})
+            cancel_download_state(entry["state"])
+            print(f"[hydra-streamer] download annulé (.part conservé, TTL 24h): {cache_name}")
+            return json_response(self, 200, {"ok": True, "cancelled": True, "cache": cache_name})
+
         if parsed.path == "/probe":
             url = first(params, "url")
             cookies = first(params, "cookies")
@@ -1119,7 +1191,9 @@ class Handler(SimpleHTTPRequestHandler):
                 # fichier partiel — jamais l'URL directement (expiration,
                 # rate-limit CDN → le player retombait en lecture directe).
                 probe_input = url
-                cached = CACHE_DIR / f"{cache_name}.bin"
+                dl_state = None
+                cache_file = CACHE_DIR / f"{cache_name}.bin"
+                cached = cache_file
                 if cached.exists():
                     probe_input = str(cached)
                     cookies = None
@@ -1130,7 +1204,30 @@ class Handler(SimpleHTTPRequestHandler):
                     if partial.exists():
                         probe_input = str(partial)
                         cookies = None
-                result = probe(probe_input, cookies)
+                try:
+                    result = probe(probe_input, cookies)
+                except RuntimeError as exc:
+                    # MP4 non-faststart (moov en fin de fichier) : le partiel
+                    # ne sera JAMAIS sondable → attendre la fin du
+                    # téléchargement puis sonder le fichier complet. Le player
+                    # patiente sur son spinner le temps de cette réponse.
+                    if (
+                        dl_state is None
+                        or Path(probe_input).suffix != ".part"
+                        or "metadata is at the end" not in str(exc)
+                    ):
+                        raise
+                    print(f"[hydra-streamer] moov en fin de fichier, attente du download: {cache_name}")
+                    deadline = time.time() + PROBE_DOWNLOAD_WAIT_SECONDS
+                    while time.time() < deadline and not cache_file.exists():
+                        if dl_state.get("error"):
+                            raise RuntimeError(f"download_failed: {dl_state['error']}")
+                        if dl_state.get("cancelled"):
+                            raise RuntimeError("download_cancelled")
+                        time.sleep(1)
+                    if not cache_file.exists():
+                        raise RuntimeError("download still in progress after 1h")
+                    result = probe(str(cache_file), None)
                 # Header MKV pas encore téléchargé (pistes vides) : attendre
                 # plus de données et re-sonder une fois avant de répondre.
                 if (
@@ -1345,7 +1442,7 @@ def cleanup_loop():
                 if expired:
                     stop_process(process)
                     if job.get("download"):
-                        job["download"]["cancelled"] = True
+                        cancel_download_state(job["download"])
                     shutil.rmtree(job.get("dir"), ignore_errors=True)
                     JOBS.pop(key, None)
         # Maintenance du cache de téléchargement (TTL 24 h + LRU 20 Go).
