@@ -21,7 +21,7 @@ from urllib.request import Request, urlopen
 APP_NAME = "HydraStreamer"
 HOST = "127.0.0.1"
 PORT = 17654
-VERSION = "0.4.3"
+VERSION = "0.4.4"
 DEFAULT_UPDATE_MANIFEST_URL = "https://hydracker.com/hydrastreamer/releases/latest.json"
 UPDATE_MANIFEST_URL = os.environ.get("HYDRASTREAMER_UPDATE_URL", DEFAULT_UPDATE_MANIFEST_URL)
 AUTO_UPDATE_ENABLED = os.environ.get("HYDRASTREAMER_AUTO_UPDATE", "1").lower() not in {"0", "false", "no"}
@@ -950,6 +950,17 @@ def job_playlist_complete(job):
         return False
 
 
+def strip_premature_endlist(text, job):
+    # ffmpeg écrit EXT-X-ENDLIST quand il sort à l'EOF partiel du fichier en
+    # cours de téléchargement : servi tel quel, le player croit la vidéo
+    # finie et la redémarre à 0 en boucle. On ne sert le marqueur de fin que
+    # quand le téléchargement est réellement terminé.
+    dl = job.get("download") or {}
+    if dl.get("done") or "#EXT-X-ENDLIST" not in text:
+        return text
+    return "\n".join(l for l in text.splitlines() if l.strip() != "#EXT-X-ENDLIST") + "\n"
+
+
 def respawn_job(key, job):
     # Reprend le transcodage au segment suivant le dernier produit, en
     # continuant la même playlist (-start_number + append_list).
@@ -1328,6 +1339,7 @@ class Handler(SimpleHTTPRequestHandler):
             text = job["playlist"].read_text(encoding="utf-8", errors="replace")
         except OSError:
             return text_response(self, 404, "playlist_not_found")
+        text = strip_premature_endlist(text, job)
 
         start = float(job.get("start_time") or 0)
         seg_dur = 4.0  # hls_time du transcodage
@@ -1380,6 +1392,17 @@ class Handler(SimpleHTTPRequestHandler):
                 time.sleep(0.25)
         if target.suffix == ".m3u8":
             self.extensions_map[".m3u8"] = "application/vnd.apple.mpegurl"
+            with LOCK:
+                job = JOBS.get(key)
+            if job is not None and target.exists():
+                dl = job.get("download") or {}
+                if not dl.get("done"):
+                    try:
+                        raw = target.read_text(encoding="utf-8", errors="replace")
+                    except OSError:
+                        raw = ""
+                    raw = strip_premature_endlist(raw, job)
+                    return text_response(self, 200, raw, "application/vnd.apple.mpegurl")
         elif target.suffix == ".ts":
             self.extensions_map[".ts"] = "video/mp2t"
         try:
