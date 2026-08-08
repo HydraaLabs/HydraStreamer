@@ -995,7 +995,11 @@ def build_vod_playlist(job):
     segments de la vidéo sont listés dès le premier poll — réels quand déjà
     transcodés, virtuels sinon. Le player voit une VOD (seek bar à la durée
     réelle, pas de live edge) et un EXT-X-ENDLIST écrit trop tôt par ffmpeg
-    (sortie à l'EOF partiel du téléchargement) n'a plus aucun effet."""
+    (sortie à l'EOF partiel du téléchargement) n'a plus aucun effet.
+
+    Numérotation : ffmpeg produit toujours en relatif au job (seg_00000 =
+    start_time). La position absolue i de la playlist correspond donc au
+    fichier seg_{i - first_seg} — valable pour les segments futurs aussi."""
     try:
         text = job["playlist"].read_text(encoding="utf-8", errors="replace")
     except OSError:
@@ -1004,27 +1008,17 @@ def build_vod_playlist(job):
     start = float(job.get("start_time") or 0)
     duration = float(job.get("duration") or 0)
     seg_dur = 4.0  # hls_time du transcodage
-
-    if duration <= 0:
-        # Durée pas encore sondée : playlist brute sans ENDLIST prématuré.
-        return strip_premature_endlist(text, job)
-
     key = job["dir"].name
-    total_segments = max(1, math.ceil(duration / seg_dur))
     first_seg = int(start // seg_dur)
 
     # Segments réellement produits, dans l'ordre de la playlist ffmpeg.
-    # La numérotation brute est RELATIVE au job (seg_00000 = start_time du
-    # job) — on la décale de first_seg pour l'aligner sur la timeline absolue
-    # de la vidéo (sinon 404 pour tout job démarré avec -ss > 0).
     real_list = []
     headers = []
     for line in text.splitlines():
         st = line.strip()
         if st.startswith("#EXTINF"):
             continue  # régénérés à la sortie
-        m = re.search(r"(?:^|/)seg_(\d+)\.ts$", st)
-        if m:
+        if re.search(r"(?:^|/)seg_(\d+)\.ts$", st):
             real_list.append(st if st.startswith("/") else "/" + st)
             continue
         if not st or st == "#EXT-X-ENDLIST" or st.startswith("#EXT-X-START") \
@@ -1032,8 +1026,6 @@ def build_vod_playlist(job):
                 or st.startswith("#EXT-X-MEDIA-SEQUENCE"):
             continue
         headers.append(st)
-
-    real = {first_seg + i: uri for i, uri in enumerate(real_list)}
 
     out = []
     for line in headers:
@@ -1043,25 +1035,40 @@ def build_vod_playlist(job):
             out.append(f"#EXT-X-START:TIME-OFFSET={start:.3f}")
             out.append("#EXT-X-MEDIA-SEQUENCE:0")
 
-    for i in range(total_segments):
-        # Le dernier segment est plus court que seg_dur (arrondi du total).
-        extinf = seg_dur if i < total_segments - 1 else max(0.1, duration - seg_dur * (total_segments - 1))
-        out.append(f"#EXTINF:{extinf:.6f},")
-        if i in real:
-            out.append(real[i])
-        elif i < first_seg:
-            # région [0, start) jamais transcodée pour ce job
-            out.append("/__virtual_skip__/seg.ts")
-        else:
-            # pas encore produit : serve_static attend sa création (60 s) ;
-            # un seek direct vers lui est intercepté par le frontend qui
-            # relance un job à cet offset.
-            out.append(f"/{key}/seg_{i:05d}.ts")
-
     dl = job.get("download") or {}
-    if dl.get("done") and len(real) >= total_segments:
-        out.append("#EXT-X-ENDLIST")
+    produced = len(real_list)
+
+    if duration > 0:
+        total_segments = max(1, math.ceil(duration / seg_dur))
+        for i in range(total_segments):
+            # Le dernier segment est plus court que seg_dur (arrondi).
+            extinf = seg_dur if i < total_segments - 1 else max(0.1, duration - seg_dur * (total_segments - 1))
+            out.append(f"#EXTINF:{extinf:.6f},")
+            if i < first_seg:
+                # région [0, start) jamais transcodée pour ce job
+                out.append("/__virtual_skip__/seg.ts")
+            elif i < first_seg + produced:
+                out.append(real_list[i - first_seg])
+            else:
+                # pas encore produit (relatif au job) : serve_static attend
+                # sa création (60 s) ; un seek direct vers lui est intercepté
+                # par le frontend qui relance un job à cet offset.
+                out.append(f"/{key}/seg_{i - first_seg:05d}.ts")
+        if dl.get("done") and produced >= total_segments - first_seg:
+            out.append("#EXT-X-ENDLIST")
+    else:
+        # Durée pas encore sondée : tête VOD + segments déjà produits — la
+        # queue complète suivra aux prochains polls. EXT-X-START est posé
+        # quand même, sinon le player repartait à 0 après un seek.
+        for _ in range(first_seg):
+            out.append(f"#EXTINF:{seg_dur:.6f},")
+            out.append("/__virtual_skip__/seg.ts")
+        for uri in real_list:
+            out.append(f"#EXTINF:{seg_dur:.6f},")
+            out.append(uri)
+
     return "\n".join(out) + "\n"
+
 
 
 def respawn_job(key, job):
