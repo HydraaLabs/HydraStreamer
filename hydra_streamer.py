@@ -1013,8 +1013,11 @@ def build_vod_playlist(job):
     total_segments = max(1, math.ceil(duration / seg_dur))
     first_seg = int(start // seg_dur)
 
-    # Segments réellement produits, indexés par numéro absolu.
-    real = {}
+    # Segments réellement produits, dans l'ordre de la playlist ffmpeg.
+    # La numérotation brute est RELATIVE au job (seg_00000 = start_time du
+    # job) — on la décale de first_seg pour l'aligner sur la timeline absolue
+    # de la vidéo (sinon 404 pour tout job démarré avec -ss > 0).
+    real_list = []
     headers = []
     for line in text.splitlines():
         st = line.strip()
@@ -1022,13 +1025,15 @@ def build_vod_playlist(job):
             continue  # régénérés à la sortie
         m = re.search(r"(?:^|/)seg_(\d+)\.ts$", st)
         if m:
-            real[int(m.group(1))] = st if st.startswith("/") else "/" + st
+            real_list.append(st if st.startswith("/") else "/" + st)
             continue
         if not st or st == "#EXT-X-ENDLIST" or st.startswith("#EXT-X-START") \
                 or st.startswith("#EXT-X-PLAYLIST-TYPE") \
                 or st.startswith("#EXT-X-MEDIA-SEQUENCE"):
             continue
         headers.append(st)
+
+    real = {first_seg + i: uri for i, uri in enumerate(real_list)}
 
     out = []
     for line in headers:
