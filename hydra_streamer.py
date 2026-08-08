@@ -1457,8 +1457,13 @@ class Handler(SimpleHTTPRequestHandler):
                     break
                 proc = job.get("process")
                 dl = job.get("download") or {}
-                # Stoppe l'attente si plus rien ne produira le segment.
-                if (proc is None or proc.poll() is not None) and job_playlist_complete(job):
+                # Stoppe l'attente seulement si PLUS RIEN ne produira le
+                # segment : ffmpeg mort + playlist close + download TERMINÉ.
+                # Un ENDLIST écrit à l'EOF partiel (download encore en cours)
+                # ne doit pas casser l'attente — le watchdog respawn ffmpeg
+                # et le segment arrivera (sinon 404 immédiat au player).
+                if (proc is None or proc.poll() is not None) \
+                        and job_playlist_complete(job) and dl.get("done"):
                     break
                 if dl.get("error"):
                     break
