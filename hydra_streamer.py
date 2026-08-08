@@ -2,6 +2,7 @@
 import argparse
 import hashlib
 import json
+import math
 import os
 import platform
 import re
@@ -21,7 +22,7 @@ from urllib.request import Request, urlopen
 APP_NAME = "HydraStreamer"
 HOST = "127.0.0.1"
 PORT = 17654
-VERSION = "0.4.4"
+VERSION = "0.5.0"
 DEFAULT_UPDATE_MANIFEST_URL = "https://hydracker.com/hydrastreamer/releases/latest.json"
 UPDATE_MANIFEST_URL = os.environ.get("HYDRASTREAMER_UPDATE_URL", DEFAULT_UPDATE_MANIFEST_URL)
 AUTO_UPDATE_ENABLED = os.environ.get("HYDRASTREAMER_AUTO_UPDATE", "1").lower() not in {"0", "false", "no"}
@@ -117,6 +118,34 @@ def forward_origin_allowed(origin):
 FORWARD_MAX_BODY = 16 * 1024
 FORWARD_MAX_RESPONSE = 2 * 1024 * 1024
 FORWARD_THROTTLE = {}
+# Circuit breaker par hôte (pattern rdt-client) : après 3 échecs réseau/5xx
+# consécutifs vers un hôte, on court-circuite les appels avec un backoff
+# exponentiel borné à 5 min — évite les cascades quand 1Fichier/CDN est down.
+FORWARD_BREAKER = {}
+FORWARD_STATS = {}
+
+
+def forward_record(host, ok):
+    now = time.time()
+    with LOCK:
+        st = FORWARD_STATS.setdefault(host, {"ok": 0, "fail": 0})
+        st["ok" if ok else "fail"] += 1
+        br = FORWARD_BREAKER.setdefault(host, {"fails": 0, "open_until": 0.0})
+        if ok:
+            br["fails"] = 0
+            br["open_until"] = 0.0
+        else:
+            br["fails"] += 1
+            if br["fails"] >= 3:
+                br["open_until"] = now + min(300, 30 * (2 ** (br["fails"] - 3)))
+
+
+def forward_circuit(host):
+    with LOCK:
+        br = FORWARD_BREAKER.get(host)
+        if br and br["open_until"] > time.time():
+            return int(br["open_until"] - time.time()) or 1
+        return 0
 # Only these request headers are forwarded to the target host.
 FORWARD_HEADER_ALLOWLIST = {"authorization", "content-type", "accept", "user-agent"}
 
@@ -961,6 +990,75 @@ def strip_premature_endlist(text, job):
     return "\n".join(l for l in text.splitlines() if l.strip() != "#EXT-X-ENDLIST") + "\n"
 
 
+def build_vod_playlist(job):
+    """Playlist HLS complète façon VOD (pattern hls-media-server) : TOUS les
+    segments de la vidéo sont listés dès le premier poll — réels quand déjà
+    transcodés, virtuels sinon. Le player voit une VOD (seek bar à la durée
+    réelle, pas de live edge) et un EXT-X-ENDLIST écrit trop tôt par ffmpeg
+    (sortie à l'EOF partiel du téléchargement) n'a plus aucun effet."""
+    try:
+        text = job["playlist"].read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+
+    start = float(job.get("start_time") or 0)
+    duration = float(job.get("duration") or 0)
+    seg_dur = 4.0  # hls_time du transcodage
+
+    if duration <= 0:
+        # Durée pas encore sondée : playlist brute sans ENDLIST prématuré.
+        return strip_premature_endlist(text, job)
+
+    key = job["dir"].name
+    total_segments = max(1, math.ceil(duration / seg_dur))
+    first_seg = int(start // seg_dur)
+
+    # Segments réellement produits, indexés par numéro absolu.
+    real = {}
+    headers = []
+    for line in text.splitlines():
+        st = line.strip()
+        if st.startswith("#EXTINF"):
+            continue  # régénérés à la sortie
+        m = re.search(r"(?:^|/)seg_(\d+)\.ts$", st)
+        if m:
+            real[int(m.group(1))] = st if st.startswith("/") else "/" + st
+            continue
+        if not st or st == "#EXT-X-ENDLIST" or st.startswith("#EXT-X-START") \
+                or st.startswith("#EXT-X-PLAYLIST-TYPE") \
+                or st.startswith("#EXT-X-MEDIA-SEQUENCE"):
+            continue
+        headers.append(st)
+
+    out = []
+    for line in headers:
+        out.append(line)
+        if line.startswith("#EXTM3U"):
+            out.append("#EXT-X-PLAYLIST-TYPE:EVENT")
+            out.append(f"#EXT-X-START:TIME-OFFSET={start:.3f}")
+            out.append("#EXT-X-MEDIA-SEQUENCE:0")
+
+    for i in range(total_segments):
+        # Le dernier segment est plus court que seg_dur (arrondi du total).
+        extinf = seg_dur if i < total_segments - 1 else max(0.1, duration - seg_dur * (total_segments - 1))
+        out.append(f"#EXTINF:{extinf:.6f},")
+        if i in real:
+            out.append(real[i])
+        elif i < first_seg:
+            # région [0, start) jamais transcodée pour ce job
+            out.append("/__virtual_skip__/seg.ts")
+        else:
+            # pas encore produit : serve_static attend sa création (60 s) ;
+            # un seek direct vers lui est intercepté par le frontend qui
+            # relance un job à cet offset.
+            out.append(f"/{key}/seg_{i:05d}.ts")
+
+    dl = job.get("download") or {}
+    if dl.get("done") and len(real) >= total_segments:
+        out.append("#EXT-X-ENDLIST")
+    return "\n".join(out) + "\n"
+
+
 def respawn_job(key, job):
     # Reprend le transcodage au segment suivant le dernier produit, en
     # continuant la même playlist (-start_number + append_list).
@@ -1093,6 +1191,13 @@ class Handler(SimpleHTTPRequestHandler):
             return json_response(self, 400, {"error": "method_not_allowed"})
         if not throttle_forward(host):
             return json_response(self, 429, {"error": "rate_limited"})
+        retry_after = forward_circuit(host)
+        if retry_after > 0:
+            return json_response(self, 503, {
+                "error": "circuit_open",
+                "detail": f"trop d'échecs récents vers {host} — nouvel essai dans {retry_after}s",
+                "retry_after": retry_after,
+            })
 
         data = None
         if method == "POST":
@@ -1115,8 +1220,11 @@ class Handler(SimpleHTTPRequestHandler):
             # 4xx/5xx still carry the API's JSON error body the caller needs.
             raw = exc.read(FORWARD_MAX_RESPONSE + 1)
             status = exc.code
+            forward_record(host, status < 500)
         except Exception as exc:
+            forward_record(host, False)
             return json_response(self, 502, {"error": "forward_failed", "detail": str(exc)[:300]})
+        forward_record(host, status < 500)
 
         return json_response(self, 200, {
             "status": status,
@@ -1147,6 +1255,7 @@ class Handler(SimpleHTTPRequestHandler):
                     "ffmpeg": ffmpeg,
                     "ffprobe": ffprobe,
                     "capabilities": {"forward": True},
+                    "forward_stats": dict(FORWARD_STATS),
                 },
             )
 
@@ -1319,48 +1428,12 @@ class Handler(SimpleHTTPRequestHandler):
                         "job": key,
                     },
                 )
-            self.path = f"/{key}/index.m3u8"
-            if start_time > 0:
-                return self.serve_offset_playlist(job)
-            return self.serve_static()
+            body = build_vod_playlist(job)
+            if body is None:
+                return text_response(self, 404, "playlist_not_found")
+            return text_response(self, 200, body, "application/vnd.apple.mpegurl")
 
         return self.serve_static()
-
-    def serve_offset_playlist(self, job):
-        # Réécrit la playlist d'un job démarré à -ss T pour qu'elle représente
-        # la timeline complète de la vidéo : le lecteur affiche la position
-        # absolue (ex. 20:00) au lieu de repartir à 0.
-        #  - EXT-X-PLAYLIST-TYPE:EVENT → la playlist est seekable partout (pas
-        #    de saut automatique vers le live edge)
-        #  - segments "virtuels" pour [0, T) (jamais téléchargés : la lecture
-        #    démarre à EXT-X-START:TIME-OFFSET=T et les seeks en arrière avant
-        #    T relancent un nouveau job côté frontend)
-        try:
-            text = job["playlist"].read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            return text_response(self, 404, "playlist_not_found")
-        text = strip_premature_endlist(text, job)
-
-        start = float(job.get("start_time") or 0)
-        seg_dur = 4.0  # hls_time du transcodage
-        virtual_count = int(start // seg_dur)
-
-        out = []
-        for line in text.splitlines():
-            if line.startswith("#EXTM3U") and "#EXT-X-PLAYLIST-TYPE" not in text:
-                out.append(line)
-                out.append("#EXT-X-PLAYLIST-TYPE:EVENT")
-                continue
-            if line.startswith("#EXTINF") and not any(
-                l.startswith("#EXT-X-START") for l in out
-            ):
-                out.append(f"#EXT-X-START:TIME-OFFSET={start:.3f}")
-                for _ in range(virtual_count):
-                    out.append(f"#EXTINF:{seg_dur:.6f},")
-                    out.append("/__virtual_skip__/seg.ts")
-            out.append(line)
-        body = "\n".join(out) + "\n"
-        return text_response(self, 200, body, "application/vnd.apple.mpegurl")
 
     def serve_static(self):
         parsed = urlparse(self.path)
@@ -1395,14 +1468,9 @@ class Handler(SimpleHTTPRequestHandler):
             with LOCK:
                 job = JOBS.get(key)
             if job is not None and target.exists():
-                dl = job.get("download") or {}
-                if not dl.get("done"):
-                    try:
-                        raw = target.read_text(encoding="utf-8", errors="replace")
-                    except OSError:
-                        raw = ""
-                    raw = strip_premature_endlist(raw, job)
-                    return text_response(self, 200, raw, "application/vnd.apple.mpegurl")
+                body = build_vod_playlist(job)
+                if body is not None:
+                    return text_response(self, 200, body, "application/vnd.apple.mpegurl")
         elif target.suffix == ".ts":
             self.extensions_map[".ts"] = "video/mp2t"
         try:
